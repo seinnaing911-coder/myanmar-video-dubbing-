@@ -92,7 +92,7 @@ Keep segments in chronological order, do not overlap them, omit music and non-sp
 Do not return the original language; text must be Burmese. Do not add explanations.
 """
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.8-flash",
             contents=[audio_file, prompt],
             config=types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json")
         )
