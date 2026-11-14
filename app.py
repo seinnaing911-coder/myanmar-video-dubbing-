@@ -78,6 +78,70 @@ def srt_time_to_seconds(t) -> float:
     return t.hours * 3600 + t.minutes * 60 + t.seconds + t.milliseconds / 1000.0
 
 
+
+def validate_and_fix_srt(srt_bytes: bytes, video_duration: float):
+    """Normalize common SRT formatting issues and safely clamp/sort cues."""
+    try:
+        raw = srt_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raw = srt_bytes.decode("utf-8", errors="replace")
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    raw = raw.replace("，", ",").replace("–>", "-->").replace("→", "-->")
+    # SRT commonly uses comma milliseconds; accept dot milliseconds too.
+    raw = re.sub(r"(\d{2}:\d{2}:\d{2})\.(\d{1,3})",
+                 lambda m: m.group(1) + "," + m.group(2).ljust(3, "0"), raw)
+    # Normalize arrows with accidental spaces around the arrow.
+    raw = re.sub(r"\s*-\s*-\s*>\s*", " --> ", raw)
+    try:
+        parsed = pysrt.from_string(raw)
+    except Exception as exc:
+        raise RuntimeError(
+            "SRT ပုံစံကို ဖတ်မရပါ။ အချိန်စာကြောင်းကို "
+            "00:00:01,000 --> 00:00:04,000 ပုံစံဖြင့် ပြင်ပါ။ " + str(exc)
+        ) from exc
+    if not parsed:
+        raise RuntimeError("SRT ဖိုင်ထဲတွင် စာတန်း မတွေ့ပါ။")
+
+    fixes = []
+    cleaned = pysrt.SubRipFile()
+    # Sort first so cues accidentally placed out of order do not break the timeline.
+    ordered = sorted(parsed, key=lambda x: (x.start.ordinal, x.end.ordinal))
+    if list(parsed) != ordered:
+        fixes.append("စာတန်းအချိန်အစီအစဉ်ကို အလိုအလျောက် စီထားပါသည်။")
+
+    for cue in ordered:
+        text = "\n".join(line.rstrip() for line in cue.text.replace("\ufeff", "").splitlines()).strip()
+        if not text:
+            fixes.append(f"စာတန်းအလွတ် #{cue.index} ကို ဖယ်ရှားထားပါသည်။")
+            continue
+        start_ms = max(0, int(cue.start.ordinal))
+        end_ms = int(cue.end.ordinal)
+        if end_ms <= start_ms:
+            fixes.append(f"#{cue.index} အချိန်အဆုံး မမှန်သောကြောင့် ဖယ်ရှားထားပါသည်။")
+            continue
+        max_ms = int(video_duration * 1000)
+        if start_ms >= max_ms:
+            fixes.append(f"#{cue.index} သည် Video အရှည်ကျော်နေသောကြောင့် ဖယ်ရှားထားပါသည်။")
+            continue
+        if end_ms > max_ms:
+            end_ms = max_ms
+            fixes.append(f"#{cue.index} အချိန်အဆုံးကို Video အရှည်အတွင်း ညှိထားပါသည်။")
+        fixed = pysrt.SubRipItem(index=len(cleaned) + 1,
+                                 start=pysrt.SubRipTime.from_ordinal(start_ms),
+                                 end=pysrt.SubRipTime.from_ordinal(end_ms), text=text)
+        cleaned.append(fixed)
+
+    if not cleaned:
+        raise RuntimeError("ပြင်ဆင်ပြီးနောက် အသုံးပြုနိုင်သော စာတန်း မကျန်ပါ။ SRT အချိန်များကို စစ်ဆေးပါ။")
+    # Report overlaps; timeline engine safely skips already-covered portions.
+    previous_end = -1
+    for cue in cleaned:
+        if cue.start.ordinal < previous_end:
+            fixes.append("စာတန်းအချိန် ထပ်နေသည့်နေရာ ရှိပါသည်။ Dubbing လုပ်ရာတွင် ထပ်နေသောအပိုင်းကို ကျော်၍ ဆက်လုပ်ပါမည်။")
+            break
+        previous_end = max(previous_end, cue.end.ordinal)
+    return cleaned, fixes
+
 def make_video_piece(source_video: str, start: float, source_length: float,
                      output_length: float, output_path: str):
     """Retimes VIDEO only. Speech audio is never sped up or slowed down."""
@@ -237,48 +301,78 @@ if video_file and srt_file:
 
     if video_mb > MAX_UPLOAD_MB or srt_mb > MAX_UPLOAD_MB:
         st.error(f"ဖိုင်တစ်ဖိုင်ချင်းစီသည် {MAX_UPLOAD_MB} MB ထက် မကြီးရပါ။")
-    elif st.button("🚀 START DUBBING", type="primary", use_container_width=True):
-        status = st.empty()
-        bar = st.progress(0)
-        try:
-            with tempfile.TemporaryDirectory(prefix="myanmar_dub_") as work_dir:
-                video_path = os.path.join(
-                    work_dir, "source_video" + Path(video_file.name).suffix.lower()
-                )
-                srt_path = os.path.join(work_dir, "source_subtitle.srt")
-                mp4_output = os.path.join(work_dir, "final_output.mp4")
+    else:
+        if st.button("🔎 SRT စစ်ဆေးပြီး Auto Fix လုပ်ပါ", use_container_width=True):
+            try:
+                with tempfile.TemporaryDirectory(prefix="srt_check_") as check_dir:
+                    check_video = os.path.join(check_dir, "check_video" + Path(video_file.name).suffix.lower())
+                    with open(check_video, "wb") as f:
+                        f.write(video_file.getbuffer())
+                    duration = get_media_duration(check_video)
+                    fixed_subs, fix_notes = validate_and_fix_srt(srt_file.getvalue(), duration)
+                    fixed_text = "\n\n".join(str(cue) for cue in fixed_subs) + "\n"
+                    st.session_state["fixed_srt_text"] = fixed_text
+                    st.session_state["fixed_srt_key"] = (video_file.name, video_file.size, srt_file.name, srt_file.size)
+                    st.session_state["srt_fix_count"] = len(fix_notes)
+                    st.session_state["srt_fix_notes"] = fix_notes
+                st.success(f"SRT စစ်ဆေးပြီးပါပြီ။ အသုံးပြုနိုင်သော စာတန်း {len(fixed_subs)} ကြောင်း ရှိပါသည်။")
+                if fix_notes:
+                    for note in fix_notes:
+                        st.warning(note)
+                else:
+                    st.info("ပြင်ဆင်ရန်လိုသော အမှား မတွေ့ပါ။")
+                st.download_button("⬇️ ပြင်ဆင်ပြီး SRT ကို Download", data=fixed_text.encode("utf-8"),
+                                   file_name="fixed_subtitles.srt", mime="text/plain")
+            except Exception as exc:
+                st.error("SRT စစ်ဆေးရာတွင် ပြဿနာရှိပါသည်။")
+                st.error(str(exc))
 
-                with open(video_path, "wb") as f:
-                    f.write(video_file.getbuffer())
-                with open(srt_path, "wb") as f:
-                    f.write(srt_file.getbuffer())
+        current_key = (video_file.name, video_file.size, srt_file.name, srt_file.size)
+        ready = st.session_state.get("fixed_srt_key") == current_key and bool(st.session_state.get("fixed_srt_text"))
+        if not ready:
+            st.info("Dubbing မစခင် အပေါ်က ‘SRT စစ်ဆေးပြီး Auto Fix လုပ်ပါ’ ကို အရင်နှိပ်ပါ။")
+        if st.button("🚀 START DUBBING", type="primary", use_container_width=True, disabled=not ready):
+            status = st.empty()
+            bar = st.progress(0)
+            try:
+                with tempfile.TemporaryDirectory(prefix="myanmar_dub_") as work_dir:
+                    video_path = os.path.join(
+                        work_dir, "source_video" + Path(video_file.name).suffix.lower()
+                    )
+                    srt_path = os.path.join(work_dir, "source_subtitle.srt")
+                    mp4_output = os.path.join(work_dir, "final_output.mp4")
 
-                status.info("ဗီဒီယိုနှင့် SRT ကို စစ်ဆေးနေပါသည်...")
-                bar.progress(5)
+                    with open(video_path, "wb") as f:
+                        f.write(video_file.getbuffer())
+                    with open(srt_path, "w", encoding="utf-8-sig") as f:
+                        f.write(st.session_state["fixed_srt_text"])
 
-                def update_tts(value, message):
-                    bar.progress(min(65, 5 + int(value * 60)))
-                    status.info(message)
+                    status.info("ပြင်ဆင်ပြီးသော SRT နှင့် Video ကို စတင်လုပ်ဆောင်နေပါသည်...")
+                    bar.progress(5)
 
-                joined_video, audio_path, duration, count = make_dubbed_timeline(
-                    video_path, srt_path, work_dir, update_tts
-                )
-                status.info("မြန်မာအသံနှင့် Video ကို ပေါင်းစပ်နေပါသည်...")
-                bar.progress(85)
-                mux_video(joined_video, audio_path, mp4_output, duration)
-                bar.progress(100)
-                status.success(
-                    f"ပြီးပါပြီ။ စာတန်း {count} ကြောင်းကို ပုံမှန်အသံအမြန်နှုန်းဖြင့် ထုတ်ပြီးပါပြီ။"
-                )
-
-                st.session_state["result_mp4"] = Path(mp4_output).read_bytes()
-                st.session_state["result_mp3"] = Path(audio_path).read_bytes()
-                st.session_state["result_name"] = Path(video_file.name).stem
-                st.session_state["result_duration"] = duration
-
-        except Exception as exc:
-            st.error("လုပ်ဆောင်မှု မအောင်မြင်ပါ။")
-            st.exception(exc)
+                    def update_tts(value, message):
+                        bar.progress(min(65, 5 + int(value * 60)))
+                        status.info(message)
+    
+                    joined_video, audio_path, duration, count = make_dubbed_timeline(
+                        video_path, srt_path, work_dir, update_tts
+                    )
+                    status.info("မြန်မာအသံနှင့် Video ကို ပေါင်းစပ်နေပါသည်...")
+                    bar.progress(85)
+                    mux_video(joined_video, audio_path, mp4_output, duration)
+                    bar.progress(100)
+                    status.success(
+                        f"ပြီးပါပြီ။ စာတန်း {count} ကြောင်းကို ပုံမှန်အသံအမြန်နှုန်းဖြင့် ထုတ်ပြီးပါပြီ။"
+                    )
+    
+                    st.session_state["result_mp4"] = Path(mp4_output).read_bytes()
+                    st.session_state["result_mp3"] = Path(audio_path).read_bytes()
+                    st.session_state["result_name"] = Path(video_file.name).stem
+                    st.session_state["result_duration"] = duration
+    
+            except Exception as exc:
+                st.error("လုပ်ဆောင်မှု မအောင်မြင်ပါ။")
+                st.exception(exc)
 
 if st.session_state.get("result_mp4") and st.session_state.get("result_mp3"):
     st.divider()
