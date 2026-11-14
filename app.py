@@ -69,7 +69,7 @@ def transcribe_translate_video(video_path: str, srt_path: str, work_dir: str,
                 data=Path(chunk_path).read_bytes(), mime_type="audio/mpeg"
             )
             transcript_response = client.models.generate_content(
-                model="gemini-3.5-transcribe",
+                model="gemini-3.8-flash",
                 contents=["Transcribe all audible speech verbatim. Return only the spoken words. If there is no speech, return an empty response.", audio_part],
             )
             transcript = (transcript_response.text or "").strip()
