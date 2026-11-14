@@ -4,18 +4,17 @@ import os
 import re
 import subprocess
 import tempfile
-import json
 from pathlib import Path
 
-from google import genai
-from google.genai import types
-from deep_translator import GoogleTranslator
-from faster_whisper import WhisperModel
-
 import edge_tts
-import pysrt
 import streamlit as st
 from pydub import AudioSegment
+
+
+# ==============================
+# Myanmar Auto Video Dubbing
+# Timeline TXT + segment-by-segment video retiming
+# ==============================
 
 st.set_page_config(
     page_title="Myanmar Video Dubbing Studio",
@@ -30,647 +29,436 @@ VOICES = {
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "500"))
 
 
-def get_gemini_key() -> str:
+def get_secret(name: str, default: str = "") -> str:
     try:
-        value = st.secrets.get("GEMINI_API_KEY", "")
+        value = st.secrets.get(name, default)
     except Exception:
-        value = ""
-    return str(value or os.getenv("GEMINI_API_KEY", "")).strip()
+        value = os.getenv(name, default)
+    return str(value or default).strip()
 
 
-def extract_audio(video_path: str, audio_path: str) -> None:
-    run_command([
-        "ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000",
-        "-b:a", "64k", audio_path,
-    ], "ဗီဒီယိုမှ အသံထုတ်ယူခြင်း")
-
-
-
-def translate_to_burmese(text: str, client=None) -> tuple[str, str]:
-    """Gemini ဖြင့် ဘာသာပြန်ရန်ကြိုးစားပြီး မရလျှင် Google Translate သုံးသည်။"""
-    clean = text.strip()
-    if not clean:
-        return "", ""
-    if client is not None:
-        prompt = (
-            "Translate the following spoken dialogue into natural, concise Burmese "
-            "(Myanmar). Preserve names and meaning. Return only the Burmese translation.\n\n"
-            + clean
-        )
-        last_error = None
-        for attempt in range(3):
-            try:
-                response = client.models.generate_content(
-                    model="gemini-3.8-flash", contents=[prompt]
-                )
-                result = (response.text or "").strip()
-                result = re.sub(r"^```(?:text)?\s*|\s*```$", "", result).strip()
-                if result:
-                    return result, ""
-                last_error = "Gemini မှ ဘာသာပြန်စာသား ဗလာပြန်လာသည်။"
-            except Exception as exc:
-                last_error = str(exc)
-                if attempt < 2:
-                    import time
-                    time.sleep(2 ** attempt)
-        # Gemini မရပါက အောက်က Google Translate ကို ဆက်သုံးပါ။
-    try:
-        result = GoogleTranslator(source="auto", target="my").translate(clean)
-        if result and result.strip():
-            note = "Gemini မရသဖြင့် Google Translate ကို အသုံးပြုထားသည်။" if client else ""
-            return result.strip(), note
-        raise RuntimeError("Google Translate မှ စာသားမရပါ။")
-    except Exception as exc:
-        detail = last_error if client else ""
-        raise RuntimeError(
-            "မြန်မာဘာသာပြန်မရပါ။ "
-            + (f"Gemini: {detail}; " if detail else "")
-            + f"Google Translate: {exc}"
-        ) from exc
-
-
-def _seconds(value) -> float:
-    """Accept numeric seconds or HH:MM:SS,mmm timestamps from Gemini."""
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip()
-    if re.fullmatch(r"\d+(?:\.\d+)?", text):
-        return float(text)
-    return parse_srt_timestamp(text)
-
-
-@st.cache_resource(show_spinner=False)
-def load_whisper_model():
-    """Load a small CPU Whisper model once per Streamlit process."""
-    return WhisperModel("tiny", device="cpu", compute_type="int8")
-
-
-def whisper_transcribe_translate(video_path: str, srt_path: str, work_dir: str, progress):
-    """Reliable local ASR fallback; does not require a Gemini API key."""
-    audio_path = os.path.join(work_dir, "whisper_input.wav")
-    extract_audio(video_path, audio_path)
-    progress(0.18, "Whisper က အသံကို နားထောင်ပြီး စာသားထုတ်နေသည်")
-    model = load_whisper_model()
-    segments, info = model.transcribe(
-        audio_path, beam_size=1, vad_filter=True, word_timestamps=False
-    )
-    raw = []
-    for seg in segments:
-        text = (seg.text or "").strip()
-        if text and seg.end > seg.start:
-            raw.append({"start": float(seg.start), "end": float(seg.end),
-                        "speaker": "Speaker", "original_text": text})
-    if not raw:
-        raise RuntimeError("Whisper က အသံထဲတွင် စကားပြောစာသား မတွေ့ပါ။")
-
-    cues = []
-    warnings = ["Gemini Video Understanding မအောင်မြင်သဖြင့် Whisper အသံစာသားထုတ်စနစ်ကို အသုံးပြုထားသည်။",
-                "Gemini မရသဖြင့် မြင်ကွင်းဖော်ပြချက် မရရှိပါ။"]
-    total = len(raw)
-    for i, item in enumerate(raw, start=1):
-        try:
-            translated, note = translate_to_burmese(item["original_text"], client=None)
-        except Exception as exc:
-            translated = item["original_text"]
-            warnings.append(f"စာကြောင်း {i} ကို ဘာသာပြန်မရပါ: {exc}")
-        item["burmese_text"] = translated
-        cues.append((item["start"], item["end"], translated))
-        progress(0.20 + (i / total) * 0.78,
-                 f"Whisper စာသားကို မြန်မာလို ပြန်ဆိုနေသည် ({i}/{total})")
-
-    with open(srt_path, "w", encoding="utf-8") as f:
-        for i, (start, end, line) in enumerate(cues, start=1):
-            f.write(f"{i}\n{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}\n{line}\n\n")
-    analysis = {
-        "video_summary_my": "Gemini မရရှိသဖြင့် Video မြင်ကွင်းအကျဉ်းချုပ် မထုတ်နိုင်ပါ။ အသံစာသားကို Whisper ဖြင့် ထုတ်ထားသည်။",
-        "scenes": [], "segments": raw,
-        "transcription_method": "Whisper local fallback",
-    }
-    Path(os.path.join(work_dir, "video_analysis.json")).write_text(
-        json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    return len(cues), warnings, analysis
-
-
-def transcribe_translate_video(video_path: str, srt_path: str, work_dir: str,
-                               progress) -> tuple[int, list[str], dict]:
-    """Prefer Gemini full-video understanding; fall back to local Whisper + translation."""
-    api_key = get_gemini_key()
-    if not api_key:
-        progress(0.05, "Gemini API Key မတွေ့ပါ — Whisper ကို အသုံးပြုမည်")
-        return whisper_transcribe_translate(video_path, srt_path, work_dir, progress)
-
-    client = genai.Client(api_key=api_key)
-    uploaded_file = None
-    try:
-        progress(0.03, "အဆင့် ၁/၅ — Video တစ်ခုလုံးကို Gemini သို့ တင်နေသည်")
-        uploaded_file = client.files.upload(file=video_path)
-        if not getattr(uploaded_file, "name", None) or not getattr(uploaded_file, "uri", None):
-            raise RuntimeError("Gemini File API မှ Video ဖိုင်အချက်အလက် မရရှိပါ။")
-        import time
-        max_wait_seconds = 15 * 60
-        waited = 0
-        while True:
-            state = getattr(uploaded_file, "state", None)
-            state_name = getattr(state, "name", str(state or "")).upper()
-            if "ACTIVE" in state_name:
-                break
-            if "FAILED" in state_name:
-                raise RuntimeError("Gemini က Video ကို ပြင်ဆင်မရပါ။")
-            if waited >= max_wait_seconds:
-                raise RuntimeError("Gemini Video ပြင်ဆင်ချိန် ၁၅ မိနစ်ကျော်သွားပါသည်။")
-            progress(min(0.20, 0.08 + (waited / max_wait_seconds) * 0.12),
-                     f"Gemini က Video ကို ပြင်ဆင်နေသည် ({waited // 5 + 1})")
-            time.sleep(5)
-            waited += 5
-            uploaded_file = client.files.get(name=uploaded_file.name)
-
-        progress(0.25, "အဆင့် ၂/၅ — Gemini AI က Video မြင်ကွင်းနှင့် အသံကို စစ်ဆေးနေသည်")
-        prompt = r"""You are an expert video understanding, transcription, and Burmese dubbing assistant.
-Analyze the ENTIRE uploaded video from beginning to end, understanding both visual scenes and audio.
-Return ONLY valid JSON:
-{"video_summary_my":"Burmese summary","scenes":[{"start":0.0,"end":5.0,"description_my":"Burmese visual description"}],"segments":[{"start":0.0,"end":2.5,"speaker":"Speaker 1","original_text":"Original spoken words","burmese_text":"Natural Burmese translation"}]}
-Transcribe every audible spoken line without omissions. Do not invent dialogue from subtitles or visuals. Use accurate timestamps in seconds. Keep segments short for dubbing. Identify speakers consistently. Describe important visual actions and scene changes. JSON only."""
-        response = client.models.generate_content(
-            model="gemini-3.8-flash", contents=[prompt, uploaded_file],
-            config=types.GenerateContentConfig(temperature=0.1, response_mime_type="application/json"),
-        )
-        response_text = (response.text or "").strip()
-        if not response_text:
-            raise RuntimeError("Gemini မှ Video analysis စာသားဗလာ ပြန်လာပါသည်။")
-        response_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", response_text, flags=re.I).strip()
-        analysis = json.loads(response_text)
-        raw_segments = analysis.get("segments", [])
-        cues = []
-        for item in raw_segments:
-            try:
-                start = max(0.0, _seconds(item.get("start", 0)))
-                end = _seconds(item.get("end", 0))
-                line = " ".join(str(item.get("burmese_text", "")).split()).strip()
-                if line and end > start + 0.05:
-                    cues.append((start, end, line))
-            except Exception:
-                pass
-        if not cues:
-            raise RuntimeError("Gemini က အသုံးပြုနိုင်သော စကားပြောစာသား မတွေ့ပါ။")
-        cues.sort(key=lambda x: (x[0], x[1]))
-        normalized = []
-        for start, end, line in cues:
-            if normalized and start < normalized[-1][1]:
-                start = normalized[-1][1]
-            if end > start + 0.05:
-                normalized.append((start, end, line))
-        with open(srt_path, "w", encoding="utf-8") as f:
-            for i, (start, end, line) in enumerate(normalized, start=1):
-                f.write(f"{i}\n{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}\n{line}\n\n")
-        analysis["segments"] = [
-            {"start": x.get("start"), "end": x.get("end"), "speaker": x.get("speaker", "Speaker"),
-             "original_text": x.get("original_text", ""), "burmese_text": x.get("burmese_text", "")}
-            for x in raw_segments
-        ]
-        analysis["transcription_method"] = "Gemini full video understanding"
-        Path(os.path.join(work_dir, "video_analysis.json")).write_text(
-            json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        progress(1.0, f"Gemini Video analysis ပြီးပါပြီ ({len(normalized)} ပိုင်း)")
-        return len(normalized), [], analysis
-    except Exception as gemini_error:
-        # A temporary 503/429 or other API failure must not stop dubbing.
-        progress(0.08, "Gemini မရရှိပါ — Whisper ဖြင့် အသံစာသားကို ဆက်ထုတ်နေသည်")
-        count, warnings, analysis = whisper_transcribe_translate(
-            video_path, srt_path, work_dir, progress
-        )
-        warnings.insert(0, f"Gemini API ပြဿနာကြောင့် fallback သုံးထားသည်: {str(gemini_error)[:350]}")
-        return count, warnings, analysis
-    finally:
-        if uploaded_file is not None and getattr(uploaded_file, "name", None):
-            try:
-                client.files.delete(name=uploaded_file.name)
-            except Exception:
-                pass
-
-def check_login() -> bool:
-    expected = str(st.secrets.get("APP_PASSWORD", os.getenv("APP_PASSWORD", ""))).strip()
+def check_login():
+    expected = get_secret("APP_PASSWORD")
     if not expected:
         st.error("APP_PASSWORD မသတ်မှတ်ရသေးပါ။ Streamlit Secrets ထဲတွင် APP_PASSWORD ထည့်ပါ။")
         st.stop()
 
     if st.session_state.get("authenticated", False):
-        return True
+        return
 
     st.title("🔐 Private Dubbing Studio")
     st.caption("ကိုယ်ပိုင်အသုံးပြုရန် Password ဖြင့် ဝင်ပါ။")
     with st.form("login_form"):
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Login", use_container_width=True)
-
     if submitted:
         if hmac.compare_digest(password, expected):
             st.session_state["authenticated"] = True
             st.rerun()
         else:
-            st.error("Password မှားနေပါတယ်။ ထပ်စမ်းကြည့်ပါ။")
+            st.error("Password မှားနေပါတယ်။")
     st.stop()
 
 
-def run_command(command: list[str], label: str) -> str:
+def run_command(command, label):
     result = subprocess.run(
-        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "Unknown FFmpeg error")[-5000:]
+        detail = (result.stderr or result.stdout or "Unknown FFmpeg error")[-3500:]
         raise RuntimeError(f"{label} မအောင်မြင်ပါ။\n{detail}")
     return result.stdout.strip()
 
 
 def get_media_duration(path: str) -> float:
     output = run_command(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", path],
-        "Media duration စစ်ဆေးခြင်း",
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+        "Video ကြာချိန်စစ်ဆေးခြင်း",
     )
-    try:
-        duration = float(output)
-    except ValueError as exc:
-        raise RuntimeError("ဗီဒီယိုကြာချိန်ကို မဖတ်နိုင်ပါ။") from exc
+    duration = float(output)
     if duration <= 0:
-        raise RuntimeError("ဗီဒီယိုကြာချိန် မမှန်ပါ။")
+        raise RuntimeError("Video ကြာချိန်ကို မှန်ကန်စွာ မဖတ်နိုင်ပါ။")
     return duration
 
 
-async def create_tts(text: str, destination: str, voice: str) -> None:
-    # Speak 10% faster than the voice's normal rate.
-    communicator = edge_tts.Communicate(text=text, voice=voice, rate="+10%")
-    await communicator.save(destination)
+def parse_stamp(stamp: str) -> float:
+    stamp = stamp.replace(",", ".")
+    parts = stamp.split(":")
+    nums = [float(x) for x in parts]
+    if len(nums) == 2:
+        minutes, seconds = nums
+        return minutes * 60 + seconds
+    if len(nums) == 3:
+        hours, minutes, seconds = nums
+        return hours * 3600 + minutes * 60 + seconds
+    raise ValueError("Timestamp ပုံစံမမှန်ပါ။")
 
 
-def timeline_txt_to_srt(txt_path: str, srt_path: str, video_duration: float):
-    """Convert [m:ss] Burmese script lines into timed subtitle cues."""
+def format_time(seconds: float) -> str:
+    total_ms = max(0, int(round(seconds * 1000)))
+    hours, rem = divmod(total_ms, 3600000)
+    minutes, rem = divmod(rem, 60000)
+    secs, ms = divmod(rem, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+
+def read_timeline_txt(txt_path: str, video_duration: float):
     raw = Path(txt_path).read_text(encoding="utf-8-sig", errors="replace")
-    pattern = re.compile(r"^\s*\[(\d{1,3}:\d{1,2}(?::\d{1,2})?(?:[.,]\d{1,3})?)\]\s*(.*?)\s*$")
-    items = []
+    pattern = re.compile(
+        r"^\s*\[(\d{1,3}:\d{1,2}(?::\d{1,2})?(?:[.,]\d{1,3})?)\]\s*(.*?)\s*$"
+    )
+    entries = []
     warnings = []
-    for line_no, line in enumerate(raw.replace("\r", "").split("\n"), start=1):
-        if not line.strip():
+
+    for line_no, raw_line in enumerate(raw.replace("\r", "").split("\n"), 1):
+        line = raw_line.strip()
+        if not line:
             continue
         match = pattern.match(line)
         if not match:
-            warnings.append(f"TXT စာကြောင်း {line_no}: [မိနစ်:စက္ကန့်] ပုံစံမဟုတ်သဖြင့် ကျော်ထားသည်။")
+            warnings.append(f"TXT စာကြောင်း {line_no}: [0:00] ပုံစံမဟုတ်သဖြင့် ကျော်ထားသည်။")
             continue
         stamp, text = match.groups()
-        bits = stamp.replace(",", ".").split(":")
         try:
-            nums = [float(x) for x in bits]
-            if len(nums) == 2:
-                seconds = nums[0] * 60 + nums[1]
-            else:
-                seconds = nums[0] * 3600 + nums[1] * 60 + nums[2]
-        except ValueError:
-            warnings.append(f"TXT စာကြောင်း {line_no}: အချိန်ကုဒ် မဖတ်နိုင်ပါ။")
+            start = parse_stamp(stamp)
+        except Exception:
+            warnings.append(f"TXT စာကြောင်း {line_no}: အချိန်ကုဒ်ဖတ်မရပါ။")
             continue
         text = " ".join(text.split()).strip()
-        if text and 0 <= seconds < video_duration:
-            items.append((seconds, text))
-    items.sort(key=lambda x: x[0])
-    # Duplicate timestamps are merged into one speech cue.
+        if not text:
+            warnings.append(f"TXT စာကြောင်း {line_no}: စာသားဗလာဖြစ်နေသည်။")
+            continue
+        if start < 0 or start >= video_duration:
+            warnings.append(f"TXT စာကြောင်း {line_no}: Video အပြင်ဘက်အချိန်ဖြစ်သဖြင့် ကျော်ထားသည်။")
+            continue
+        entries.append((start, text))
+
+    entries.sort(key=lambda item: item[0])
+
     merged = []
-    for start, text in items:
+    for start, text in entries:
         if merged and abs(start - merged[-1][0]) < 0.001:
             merged[-1] = (start, merged[-1][1] + " " + text)
         else:
             merged.append((start, text))
+
+    if not merged:
+        raise RuntimeError("TXT ထဲတွင် အသုံးပြုနိုင်သော [0:00] Timeline နှင့် စာသား မတွေ့ပါ။")
+
     cues = []
     for i, (start, text) in enumerate(merged):
         end = merged[i + 1][0] if i + 1 < len(merged) else video_duration
-        if end > start + 0.05:
-            cues.append((start, end, text))
+        if end - start <= 0.03:
+            warnings.append(f"{format_time(start)} အပိုင်းသည် အလွန်တိုနေသဖြင့် ကျော်ထားသည်။")
+            continue
+        cues.append({"start": start, "end": end, "text": text})
+
     if not cues:
-        raise RuntimeError("TXT ထဲမှာ အသုံးပြုနိုင်တဲ့ [0:00] Timeline နဲ့ စာသား မတွေ့ပါ။")
-    with open(srt_path, "w", encoding="utf-8") as f:
-        for i, (start, end, text) in enumerate(cues, 1):
-            f.write(f"{i}\n{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}\n{text}\n\n")
-    return len(cues), warnings
+        raise RuntimeError("အသုံးပြုနိုင်သော Timeline အပိုင်း မကျန်ပါ။")
+    return cues, warnings
 
 
-def srt_time_to_seconds(t) -> float:
-    return t.hours * 3600 + t.minutes * 60 + t.seconds + t.milliseconds / 1000.0
+async def create_tts(text: str, output_path: str, voice: str):
+    # Default speech rate: 10% faster than normal.
+    communicator = edge_tts.Communicate(
+        text=text,
+        voice=voice,
+        rate="+10%",
+    )
+    await communicator.save(output_path)
 
 
-def make_video_piece(source_video: str, start: float, source_length: float,
-                     output_length: float, output_path: str):
-    """Retimes VIDEO only. Speech audio is never sped up or slowed down."""
-    if source_length <= 0.02 or output_length <= 0.02:
+def make_video_piece(
+    source_video: str,
+    start: float,
+    source_length: float,
+    output_length: float,
+    output_path: str,
+):
+    if source_length <= 0.03 or output_length <= 0.03:
         raise RuntimeError("Video အပိုင်းကြာချိန် အလွန်တိုနေပါသည်။")
-    # setpts multiplier: target duration / source duration
+
     pts_factor = output_length / source_length
     run_command(
         [
-            "ffmpeg", "-y", "-ss", f"{start:.6f}", "-i", source_video,
-            "-t", f"{source_length:.6f}", "-an",
+            "ffmpeg", "-y",
+            "-ss", f"{start:.6f}",
+            "-i", source_video,
+            "-t", f"{source_length:.6f}",
+            "-map", "0:v:0",
+            "-an",
             "-vf", f"setpts={pts_factor:.9f}*(PTS-STARTPTS),fps=30",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
             output_path,
         ],
         "Video အပိုင်းအမြန်နှုန်းညှိခြင်း",
     )
 
 
-def parse_srt_timestamp(value: str) -> float:
-    value = value.strip().replace('.', ',')
-    match = re.fullmatch(r'(\d{1,3}):(\d{1,2}):(\d{1,2}),(\d{1,3})', value)
-    if not match:
-        raise ValueError(f"အချိန်ပုံစံ မမှန်ပါ: {value}")
-    h, m, sec, ms = (int(x) for x in match.groups())
-    return h * 3600 + m * 60 + sec + int(str(ms).ljust(3, '0')[:3]) / 1000.0
+def make_unchanged_piece(source_video, start, length, output_path):
+    make_video_piece(source_video, start, length, length, output_path)
 
 
-def format_srt_timestamp(seconds: float) -> str:
-    total_ms = max(0, int(round(seconds * 1000)))
-    h, rem = divmod(total_ms, 3600000)
-    m, rem = divmod(rem, 60000)
-    sec, ms = divmod(rem, 1000)
-    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
+def build_dubbed_video(video_path, cues, work_dir, voice, progress):
+    original_duration = get_media_duration(video_path)
+    audio_parts = []
+    video_parts = []
+    warnings = []
 
+    # Preserve the opening section before the first script timestamp.
+    first_start = cues[0]["start"]
+    if first_start > 0.03:
+        opening_path = os.path.join(work_dir, "video_piece_000.mp4")
+        make_unchanged_piece(video_path, 0.0, first_start, opening_path)
+        video_parts.append(opening_path)
+        audio_parts.append(
+            AudioSegment.silent(duration=int(round(first_start * 1000)), frame_rate=24000)
+            .set_channels(1)
+        )
 
-def auto_fix_srt(source_path: str, fixed_path: str, video_duration: float):
-    """Repair common SRT formatting/timing issues and return a concise report."""
-    raw = Path(source_path).read_text(encoding='utf-8-sig', errors='replace')
-    raw = raw.replace('\r\n', '\n').replace('\r', '\n')
-    blocks = re.split(r'\n\s*\n', raw.strip())
-    fixed_blocks, warnings = [], []
-    cue_count = 0
-    for block in blocks:
-        lines = [line.strip('\ufeff') for line in block.split('\n')]
-        time_index = next((i for i, line in enumerate(lines) if '-->' in line), None)
-        if time_index is None:
-            continue
-        time_line = lines[time_index]
-        match = re.search(r'(.+?)\s*-->\s*(.+?)(?:\s+.*)?$', time_line)
-        if not match:
-            warnings.append('ဖတ်မရသော timestamp တစ်ခုကို ကျော်ထားသည်')
-            continue
-        try:
-            start = parse_srt_timestamp(match.group(1).strip())
-            end = parse_srt_timestamp(match.group(2).strip().split()[0])
-        except ValueError:
-            # Also accept timestamps with a dot separator and normalize them.
-            try:
-                start = parse_srt_timestamp(match.group(1).strip().replace('.', ','))
-                end = parse_srt_timestamp(match.group(2).strip().split()[0].replace('.', ','))
-            except ValueError:
-                warnings.append('အချိန်ပုံစံမမှန်သော စာတန်းတစ်ခုကို ကျော်ထားသည်')
-                continue
-        if start < 0:
-            start = 0.0
-            warnings.append('အနုတ်အချိန်ကို 00:00:00,000 သို့ ပြင်ထားသည်')
-        if start >= video_duration:
-            warnings.append('ဗီဒီယိုအဆုံးကျော်နေသော စာတန်းတစ်ခုကို ဖယ်ထားသည်')
-            continue
-        if end > video_duration:
-            end = video_duration
-            warnings.append('ဗီဒီယိုအရှည်ထက်ကျော်သော အဆုံးအချိန်ကို ညှိထားသည်')
-        if end <= start + 0.03:
-            warnings.append('ကြာချိန်မရှိ/အနုတ်ဖြစ်နေသော စာတန်းတစ်ခုကို ဖယ်ထားသည်')
-            continue
-        text_lines = [line.strip() for line in lines[time_index + 1:] if line.strip()]
-        if not text_lines:
-            warnings.append('စာသားဗလာဖြစ်နေသော စာတန်းတစ်ခုကို ဖယ်ထားသည်')
-            continue
-        cue_count += 1
-        fixed_blocks.append('\n'.join([
-            str(cue_count),
-            f"{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}",
-            *text_lines,
-        ]))
-    if not fixed_blocks:
-        raise RuntimeError('ပြင်ဆင်ပြီးနောက် အသုံးပြုနိုင်သော SRT စာတန်း မကျန်ပါ။ Timestamp များကို စစ်ဆေးပါ။')
-    Path(fixed_path).write_text('\n\n'.join(fixed_blocks) + '\n', encoding='utf-8')
-    return cue_count, list(dict.fromkeys(warnings))
+    for index, cue in enumerate(cues, start=1):
+        source_start = cue["start"]
+        source_end = cue["end"]
+        source_length = source_end - source_start
 
+        speech_path = os.path.join(work_dir, f"speech_{index:05d}.mp3")
+        asyncio.run(create_tts(cue["text"], speech_path, voice))
 
-def make_dubbed_timeline(video_path: str, srt_path: str, work_dir: str, voice: str, progress):
-    """Keep the original video timeline intact and place each Burmese line at its timestamp.
-
-    TTS is generated at +10%. If a line does not fit before the next timestamp,
-    pitch-preserving atempo may increase it a little further, up to +25% total.
-    Silence remains silent. The source video is never cut, dropped, or retimed.
-    """
-    video_duration = get_media_duration(video_path)
-    fixed_srt_path = os.path.join(work_dir, 'auto_fixed_subtitles.srt')
-    fixed_count, fix_warnings = auto_fix_srt(srt_path, fixed_srt_path, video_duration)
-    subtitles = pysrt.open(fixed_srt_path, encoding="utf-8")
-    if not subtitles:
-        raise RuntimeError("SRT ဖိုင်ထဲတွင် စာတန်း မတွေ့ပါ။")
-
-    valid = []
-    for sub in subtitles:
-        line = " ".join(sub.text.replace("\ufeff", "").split()).strip()
-        start = max(0.0, srt_time_to_seconds(sub.start))
-        end = min(video_duration, srt_time_to_seconds(sub.end))
-        if line and start < video_duration and end - start > 0.03:
-            valid.append((line, start, end))
-    valid.sort(key=lambda item: (item[1], item[2]))
-    if not valid:
-        raise RuntimeError("အသုံးပြုနိုင်တဲ့ SRT စာကြောင်း မတွေ့ပါ။")
-
-    async def generate_all():
-        paths = []
-        for i, (line, _, _) in enumerate(valid, start=1):
-            audio_path = os.path.join(work_dir, f"speech_{i:05d}.mp3")
-            await create_tts(line, audio_path, voice)
-            paths.append(audio_path)
-            progress((i / len(valid)) * 0.55, f"မြန်မာအသံ ဖန်တီးခြင်း ({i}/{len(valid)})")
-        return paths
-
-    speech_paths = asyncio.run(generate_all())
-    # Start with a fully silent track the exact length of the original video.
-    audio_timeline = AudioSegment.silent(
-        duration=int(round(video_duration * 1000)), frame_rate=24000
-    ).set_channels(1)
-    timing_warnings = []
-
-    for i, ((line, start, _), speech_path) in enumerate(zip(valid, speech_paths)):
         speech = AudioSegment.from_file(speech_path, format="mp3")
         speech = speech.set_channels(1).set_frame_rate(24000)
         speech_duration = len(speech) / 1000.0
-        next_start = valid[i + 1][1] if i + 1 < len(valid) else video_duration
-        slot = max(0.05, next_start - start)
 
-        # Edge TTS is already +10%. Add only enough pitch-preserving speed-up
-        # to fit the available slot, with a total speed ceiling of about +25%.
-        if speech_duration > slot + 0.04:
-            extra_atempo = min(speech_duration / slot, 1.136)
-            if extra_atempo > 1.001:
-                fitted_path = os.path.join(work_dir, f"speech_fit_{i+1:05d}.mp3")
-                run_command([
-                    "ffmpeg", "-y", "-i", speech_path,
-                    "-filter:a", f"atempo={extra_atempo:.5f}",
-                    "-vn", "-b:a", "192k", fitted_path,
-                ], "အသံအချိန်ကို သဘာဝကျအောင် ညှိခြင်း")
-                speech = AudioSegment.from_file(fitted_path, format="mp3")
-                speech = speech.set_channels(1).set_frame_rate(24000)
-                speech_duration = len(speech) / 1000.0
-            if speech_duration > slot + 0.08:
-                timing_warnings.append(
-                    f"{format_srt_timestamp(start)} မှ စာကြောင်းတစ်ကြောင်းသည် နောက် Timeline မတိုင်မီ မပြီးနိုင်ပါ။ စာသားတိုစေခြင်း သို့မဟုတ် နောက်အချိန်ကုဒ်ကို နောက်ရွှေ့ပါ။"
-                )
+        # Keep video speed within a practical range when speech is short.
+        # If speech is longer than the source segment, extend the video segment
+        # to the speech length so the next segment starts only after this line.
+        minimum_output_length = source_length / 2.0  # maximum 2x speed-up
+        output_length = max(speech_duration, minimum_output_length)
 
-        position_ms = max(0, int(round(start * 1000)))
-        # Overlay speech at its absolute timestamp; all other positions stay silent.
-        audio_timeline = audio_timeline.overlay(speech, position=position_ms)
-        progress(0.55 + ((i + 1) / len(valid)) * 0.45,
-                 f"Timeline အသံချိန်ညှိခြင်း ({i+1}/{len(valid)})")
+        if speech_duration > source_length * 2.0:
+            warnings.append(
+                f"{format_time(source_start)}: အသံသည် မူရင်း Video အပိုင်းထက် အလွန်ရှည်သဖြင့် "
+                "Video ကို ၂ ဆထက်ပို၍ နှေးအောင်ညှိထားသည်။"
+            )
+        elif speech_duration < minimum_output_length - 0.03:
+            warnings.append(
+                f"{format_time(source_start)}: အသံတိုသောကြောင့် Video ကို အများဆုံး ၂ ဆသာ မြန်စေပြီး "
+                "ကျန်အချိန်တွင် အသံတိတ်ထားသည်။"
+            )
 
-    mp3_output = os.path.join(work_dir, "dubbed_audio.mp3")
-    audio_timeline.export(mp3_output, format="mp3", bitrate="192k")
-    # Return the untouched source video so no scene or frame can disappear.
-    return video_path, mp3_output, video_duration, len(valid), fix_warnings + timing_warnings
+        piece_path = os.path.join(work_dir, f"video_piece_{index:05d}.mp4")
+        make_video_piece(
+            video_path,
+            source_start,
+            source_length,
+            output_length,
+            piece_path,
+        )
+        video_parts.append(piece_path)
 
+        # Audio occupies the start of its corresponding retimed video segment.
+        target_ms = int(round(output_length * 1000))
+        if len(speech) < target_ms:
+            speech += AudioSegment.silent(
+                duration=target_ms - len(speech),
+                frame_rate=24000,
+            ).set_channels(1)
+        elif len(speech) > target_ms:
+            speech = speech[:target_ms]
+        audio_parts.append(speech)
 
-def mux_video(video_path: str, audio_path: str, output_path: str, duration: float):
+        progress(
+            0.10 + 0.78 * (index / len(cues)),
+            f"အပိုင်း {index}/{len(cues)} — အသံနှင့် Video ကို ညှိနေသည်",
+        )
+
+    # Join all video pieces in source order.
+    concat_list = os.path.join(work_dir, "video_concat.txt")
+    with open(concat_list, "w", encoding="utf-8") as f:
+        for path in video_parts:
+            safe_path = os.path.abspath(path).replace("'", "'\\''")
+            f.write(f"file '{safe_path}'\n")
+
+    joined_video = os.path.join(work_dir, "joined_video.mp4")
     run_command(
         [
-            "ffmpeg", "-y", "-i", video_path, "-i", audio_path,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-t", f"{duration:.3f}", "-movflags", "+faststart", output_path,
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_list,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            "-movflags", "+faststart",
+            joined_video,
         ],
-        "Final MP4 ထုတ်လုပ်ခြင်း",
+        "Video အပိုင်းများပေါင်းစပ်ခြင်း",
     )
 
+    # Join audio in the exact same order and duration as the video pieces.
+    full_audio = AudioSegment.empty()
+    for part in audio_parts:
+        full_audio += part
+
+    audio_output = os.path.join(work_dir, "dubbed_audio.mp3")
+    full_audio.export(audio_output, format="mp3", bitrate="192k")
+
+    output_duration = len(full_audio) / 1000.0
+    final_output = os.path.join(work_dir, "myanmar_dubbed_video.mp4")
+    run_command(
+        [
+            "ffmpeg", "-y",
+            "-i", joined_video,
+            "-i", audio_output,
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-t", f"{output_duration:.3f}",
+            "-movflags", "+faststart",
+            final_output,
+        ],
+        "နောက်ဆုံး MP4 ထုတ်လုပ်ခြင်း",
+    )
+
+    return final_output, output_duration, warnings
+
+
+# ==============================
+# User interface
+# ==============================
 
 check_login()
 
 st.title("🎬 Myanmar Auto Video Dubbing")
-st.caption("Video တစ်ခုတည်းတင်ပါ။ Gemini က မြင်ကွင်းနှင့်အသံကို နားလည်မည်။ Gemini မရပါက Whisper က အသံစာသားထုတ်ပြီး မြန်မာလိုပြန်ဆိုကာ Dubbing ဆက်လုပ်မည်။")
+st.caption("Video တစ်ခုနှင့် Timeline ပါသော မြန်မာ TXT Script တစ်ခုတင်ပြီး Dubbing ပြုလုပ်ပါ။")
 
 with st.sidebar:
     st.subheader("အသံဆက်တင်")
-    st.caption("မြန်မာအသံရွေးချယ်မှုကို အောက်တွင် ပြုလုပ်နိုင်ပါသည်။")
+    st.caption("မြန်မာအသံရွေးချယ်နိုင်ပါသည်။")
     st.caption(f"Upload ကန့်သတ်ချက်: {MAX_UPLOAD_MB} MB")
-    st.caption("Timeline TXT Script + Gemini Video Understanding + Whisper အရန်စနစ်")
+    st.caption("အသံနှုန်း: ပုံမှန်ထက် ၁၀% မြန်")
     if st.button("Logout", use_container_width=True):
         st.session_state["authenticated"] = False
         st.rerun()
 
-selected_voice_label = st.selectbox("🎙️ မြန်မာအသံရွေးချယ်ပါ", list(VOICES.keys()), index=0)
-selected_voice = VOICES[selected_voice_label]
+voice_label = st.selectbox("🎙️ မြန်မာအသံရွေးချယ်ပါ", list(VOICES.keys()))
+voice_name = VOICES[voice_label]
 
-video_file = st.file_uploader("မူရင်းဗီဒီယို Upload လုပ်ပါ", type=["mp4", "mov", "mkv", "webm"])
-txt_file = st.file_uploader("မြန်မာ TXT Script (ဥပမာ [0:00] စာသား) Upload လုပ်ပါ", type=["txt"])
-
-st.info(
-    "လုပ်ဆောင်ပုံ — Gemini ဖြင့် Video မြင်ကွင်းနှင့် အသံကို နားလည်မည်။ Gemini မရပါက Whisper ဖြင့် အသံစာသားထုတ်ပြီး မြန်မာလို ပြန်ဆိုမည် → "
-    "ရွေးချယ်ထားသော မြန်မာအသံထုတ်မည် → Video နှင့် အသံကို ပေါင်းစပ်မည်။ "
-    "TXT Timeline ရှိပါက အချိန်ကုဒ်တစ်ခုချင်းစီတွင် အသံစမည်။ Video မူရင်းအပိုင်းအားလုံးကို မဖြတ်မတောက် ထိန်းထားမည်။ မြန်မာအသံကို ပုံမှန်ထက် ၁၀% မြန်စေပြီး လိုအပ်လျှင် အများဆုံး ၂၅% ခန့်အထိသာ ထပ်မြန်ညှိမည်။ စကားမရှိသည့်အချိန်တွင် အသံတိတ်ထားမည်။"
+video_file = st.file_uploader(
+    "မူရင်း Video တင်ပါ",
+    type=["mp4", "mov", "mkv", "webm"],
+)
+txt_file = st.file_uploader(
+    "မြန်မာ TXT Script တင်ပါ",
+    type=["txt"],
 )
 
-if video_file:
+with st.expander("TXT Script ရေးသားပုံ ဥပမာ", expanded=True):
+    st.code(
+        "[0:00] မင်္ဂလာပါ။ ဒီနေ့မှာ အကြောင်းအရာတစ်ခုကို ပြောပြပါမယ်။\n"
+        "[0:06] အခု ဒီနေရာကို ကြည့်လိုက်ပါ။\n"
+        "[0:13] နောက်တစ်ဆင့်ကို ဆက်သွားကြရအောင်။",
+        language="text",
+    )
+    st.caption(
+        "အချိန်ကုဒ်ကို [မိနစ်:စက္ကန့်] ပုံစံရေးပါ။ "
+        "စာကြောင်းတစ်ကြောင်းစီ၏ အချိန်သည် အဲဒီအသံစမည့် မူရင်း Video အချိန်ဖြစ်သည်။"
+    )
+
+st.info(
+    "လုပ်ဆောင်ပုံ — Script တစ်ကြောင်းချင်းအတွက် မြန်မာအသံဖန်တီးမည်။ "
+    "သက်ဆိုင်ရာ မူရင်း Video အပိုင်းကိုလည်း ဖြတ်ပြီး အသံကြာချိန်နှင့် ကိုက်ညီအောင် "
+    "အမြန်နှုန်းညှိမည်။ Video အပိုင်းများကို မူရင်းအစဉ်အတိုင်း ပြန်ပေါင်းမည်။"
+)
+
+if video_file is not None:
     video_mb = video_file.size / (1024 * 1024)
     st.write(f"Video: **{video_file.name}** ({video_mb:.1f} MB)")
-    if video_mb > MAX_UPLOAD_MB:
-        st.error(f"ဖိုင်သည် {MAX_UPLOAD_MB} MB ထက် မကြီးရပါ။")
-    elif st.button("🚀 START AUTO DUBBING", type="primary", use_container_width=True):
-        status = st.empty()
-        bar = st.progress(0)
-        st.caption(f"ရွေးချယ်ထားသောအသံ: {selected_voice_label}")
-        try:
-            with tempfile.TemporaryDirectory(prefix="myanmar_auto_dub_") as work_dir:
-                video_path = os.path.join(
-                    work_dir, "source_video" + Path(video_file.name).suffix.lower()
-                )
-                srt_path = os.path.join(work_dir, "ai_translated.srt")
-                mp4_output = os.path.join(work_dir, "final_output.mp4")
-                with open(video_path, "wb") as f:
-                    f.write(video_file.getbuffer())
+if txt_file is not None:
+    st.write(f"TXT: **{txt_file.name}**")
 
-                if txt_file is not None:
-                    txt_path = os.path.join(work_dir, "burmese_script.txt")
-                    with open(txt_path, "wb") as f:
-                        f.write(txt_file.getbuffer())
-                    video_duration = get_media_duration(video_path)
-                    cue_count, ai_warnings = timeline_txt_to_srt(txt_path, srt_path, video_duration)
-                    video_analysis = {
-                        "video_summary_my": "အသုံးပြုသူတင်ထားသော Timeline TXT Script ကို အသုံးပြုထားသည်။",
-                        "scenes": [], "segments": [], "transcription_method": "Timeline TXT Script"
-                    }
-                    bar.progress(60)
-                    status.info(f"အဆင့် ၂/၅ — Timeline TXT ကို ဖတ်ပြီးပါပြီ ({cue_count} ပိုင်း) | ၆၀%")
-                else:
-                    status.info("အဆင့် ၁/၅ — Video တစ်ခုလုံးကို Gemini သို့ တင်နေသည် (၁၀%)")
-                    def update_ai(value, message):
-                        overall = 10 + int(value * 45)
-                        bar.progress(max(1, min(60, overall)))
-                        status.info(f"{message} | စုစုပေါင်း {overall}%")
+ready = video_file is not None and txt_file is not None
+if not ready:
+    st.warning("စတင်ရန် Video နဲ့ TXT Script နှစ်ခုလုံး တင်ပေးပါ။")
 
-                    cue_count, ai_warnings, video_analysis = transcribe_translate_video(
-                        video_path, srt_path, work_dir, update_ai
-                    )
-                st.session_state["video_analysis"] = video_analysis
-                status.info("အဆင့် ၃/၅ — ရွေးချယ်ထားသော မြန်မာအသံ ဖန်တီးခြင်း (၅၅% မှ ၇၇%)")
-                def update_tts(value, message):
-                    overall = 55 + int(value * 40)
-                    bar.progress(min(95, overall))
-                    stage = "အဆင့် ၃/၅" if value <= 0.55 else "အဆင့် ၄/၅"
-                    status.info(f"{stage} — {message} | စုစုပေါင်း {overall}%")
+if video_file is not None and video_file.size > MAX_UPLOAD_MB * 1024 * 1024:
+    st.error(f"Video ဖိုင်သည် {MAX_UPLOAD_MB} MB ထက် မကြီးရပါ။")
+elif ready and st.button(
+    "🚀 START AUTO DUBBING",
+    type="primary",
+    use_container_width=True,
+):
+    progress_bar = st.progress(0)
+    status = st.empty()
 
-                joined_video, audio_path, duration, count, fix_warnings = make_dubbed_timeline(
-                    video_path, srt_path, work_dir, selected_voice, update_tts
-                )
-                status.info("အဆင့် ၅/၅ — နောက်ဆုံး MP4 ဖိုင်ပေါင်းစပ်ခြင်း (၉၅% မှ ၁၀၀%)")
-                bar.progress(95)
-                mux_video(joined_video, audio_path, mp4_output, duration)
-                bar.progress(100)
-                status.success(f"အဆင့် ၅/၅ ပြီးပါပြီ — ၁၀၀% | {selected_voice_label} အသံဖြင့် မြန်မာအသံ {count} ပိုင်း ထုတ်လုပ်ပြီးပါပြီ။")
-                if ai_warnings or fix_warnings:
-                    with st.expander("လုပ်ဆောင်မှု မှတ်တမ်း"):
-                        for warning in ai_warnings + fix_warnings:
-                            st.write("• " + warning)
+    def update_progress(value, message):
+        progress_bar.progress(max(0.0, min(1.0, float(value))))
+        status.write(message)
 
-                st.session_state["result_mp4"] = Path(mp4_output).read_bytes()
-                st.session_state["result_mp3"] = Path(audio_path).read_bytes()
-                st.session_state["result_name"] = Path(video_file.name).stem
-        except Exception as exc:
-            st.error("လုပ်ဆောင်မှု မအောင်မြင်ပါ။")
-            st.exception(exc)
+    try:
+        with tempfile.TemporaryDirectory(prefix="myanmar_dub_") as work_dir:
+            video_path = os.path.join(
+                work_dir,
+                "source_video" + Path(video_file.name).suffix.lower(),
+            )
+            txt_path = os.path.join(work_dir, "burmese_script.txt")
 
-if st.session_state.get("result_mp4") and st.session_state.get("result_mp3"):
-    st.divider()
-    st.subheader("✅ ရလဒ်များ")
-    analysis = st.session_state.get("video_analysis", {})
-    if analysis:
-        with st.expander("🎬 AI က နားလည်ထားသော Video အကြောင်းအရာနှင့် စာသား", expanded=False):
-            summary = analysis.get("video_summary_my", "")
-            if summary:
-                st.markdown("**Video အကျဉ်းချုပ်**")
-                st.write(summary)
-            scenes = analysis.get("scenes", [])
-            if scenes:
-                st.markdown("**မြင်ကွင်းများ**")
-                for scene in scenes:
-                    st.write(f"{scene.get('start', '')}s–{scene.get('end', '')}s: {scene.get('description_my', '')}")
-            transcript = analysis.get("segments", [])
-            if transcript:
-                st.markdown("**အသံစာသားနှင့် မြန်မာဘာသာပြန်**")
-                for seg in transcript:
-                    st.write(f"{seg.get('speaker', 'Speaker')} | {seg.get('start', '')}s–{seg.get('end', '')}s")
-                    original = seg.get("original_text", "")
-                    if original:
-                        st.caption(original)
-                    st.write(seg.get("burmese_text", ""))
-    st.video(st.session_state["result_mp4"])
-    st.audio(st.session_state["result_mp3"], format="audio/mp3")
-    base = st.session_state.get("result_name", "dubbed_video")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.download_button("⬇️ Download MP4 Video", data=st.session_state["result_mp4"],
-                           file_name=f"{base}_myanmar_dub.mp4", mime="video/mp4",
-                           use_container_width=True)
-    with col2:
-        st.download_button("⬇️ Download MP3 Audio", data=st.session_state["result_mp3"],
-                           file_name=f"{base}_myanmar_dub.mp3", mime="audio/mpeg",
-                           use_container_width=True)
+            with open(video_path, "wb") as f:
+                f.write(video_file.getbuffer())
+            with open(txt_path, "wb") as f:
+                f.write(txt_file.getbuffer())
 
-st.divider()
-st.caption("ဖိုင်များကို ယာယီဖိုလ်ဒါတွင်သာ Process လုပ်ပြီး ပြီးဆုံးပါက ဖျက်ပစ်ပါသည်။")
+            update_progress(0.03, "အဆင့် ၁ — Video ကြာချိန်နှင့် Timeline စစ်ဆေးနေသည်")
+            duration = get_media_duration(video_path)
+            cues, parse_warnings = read_timeline_txt(txt_path, duration)
+
+            st.write(f"အသုံးပြုမည့် Script အပိုင်း: **{len(cues)} ပိုင်း**")
+            for warning in parse_warnings:
+                st.warning(warning)
+
+            update_progress(0.08, "အဆင့် ၂ — မြန်မာအသံနှင့် Video အပိုင်းများ ဖန်တီးနေသည်")
+            final_path, final_duration, timing_warnings = build_dubbed_video(
+                video_path,
+                cues,
+                work_dir,
+                voice_name,
+                update_progress,
+            )
+
+            update_progress(0.96, "အဆင့် ၃ — နောက်ဆုံးဖိုင် ပြင်ဆင်နေသည်")
+            with open(final_path, "rb") as f:
+                output_bytes = f.read()
+
+            st.success("Dubbing ပြီးပါပြီ။")
+            st.video(output_bytes)
+            st.download_button(
+                "⬇️ မြန်မာအသံထည့်ပြီး Video ကို Download လုပ်ပါ",
+                data=output_bytes,
+                file_name="myanmar_dubbed_video.mp4",
+                mime="video/mp4",
+                use_container_width=True,
+            )
+            st.caption(f"နောက်ဆုံး Video ကြာချိန်: {final_duration:.1f} စက္ကန့်")
+
+            for warning in timing_warnings:
+                st.warning(warning)
+
+            progress_bar.progress(1.0)
+            status.write("ပြီးပါပြီ။")
+    except Exception as exc:
+        st.error("လုပ်ဆောင်ရာတွင် အမှားဖြစ်သွားပါသည်။")
+        st.exception(exc)
