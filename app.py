@@ -450,6 +450,12 @@ def auto_fix_srt(source_path: str, fixed_path: str, video_duration: float):
 
 
 def make_dubbed_timeline(video_path: str, srt_path: str, work_dir: str, voice: str, progress):
+    """Keep the original video timeline intact and place each Burmese line at its timestamp.
+
+    TTS is generated at +10%. If a line does not fit before the next timestamp,
+    pitch-preserving atempo may increase it a little further, up to +25% total.
+    Silence remains silent. The source video is never cut, dropped, or retimed.
+    """
     video_duration = get_media_duration(video_path)
     fixed_srt_path = os.path.join(work_dir, 'auto_fixed_subtitles.srt')
     fixed_count, fix_warnings = auto_fix_srt(srt_path, fixed_srt_path, video_duration)
@@ -459,10 +465,10 @@ def make_dubbed_timeline(video_path: str, srt_path: str, work_dir: str, voice: s
 
     valid = []
     for sub in subtitles:
-        line = " ".join(sub.text.replace("\\ufeff", "").split()).strip()
+        line = " ".join(sub.text.replace("\ufeff", "").split()).strip()
         start = max(0.0, srt_time_to_seconds(sub.start))
         end = min(video_duration, srt_time_to_seconds(sub.end))
-        if line and end - start > 0.03:
+        if line and start < video_duration and end - start > 0.03:
             valid.append((line, start, end))
     valid.sort(key=lambda item: (item[1], item[2]))
     if not valid:
@@ -478,73 +484,48 @@ def make_dubbed_timeline(video_path: str, srt_path: str, work_dir: str, voice: s
         return paths
 
     speech_paths = asyncio.run(generate_all())
+    # Start with a fully silent track the exact length of the original video.
+    audio_timeline = AudioSegment.silent(
+        duration=int(round(video_duration * 1000)), frame_rate=24000
+    ).set_channels(1)
+    timing_warnings = []
 
-    video_pieces = []
-    audio_timeline = AudioSegment.empty().set_frame_rate(24000).set_channels(1)
-    source_cursor = 0.0
-    used_count = 0
-
-    for i, ((line, raw_start, end), speech_path) in enumerate(zip(valid, speech_paths), start=1):
-        start = max(raw_start, source_cursor)
-        if end <= start + 0.03:
-            continue
-
-        # Keep the silent gap at normal video speed and preserve matching audio silence.
-        if start > source_cursor + 0.02:
-            gap = start - source_cursor
-            gap_path = os.path.join(work_dir, f"video_gap_{i:05d}.mp4")
-            make_video_piece(video_path, source_cursor, gap, gap, gap_path)
-            video_pieces.append(gap_path)
-            audio_timeline += AudioSegment.silent(
-                duration=int(gap * 1000), frame_rate=24000
-            ).set_channels(1)
-
+    for i, ((line, start, _), speech_path) in enumerate(zip(valid, speech_paths)):
         speech = AudioSegment.from_file(speech_path, format="mp3")
         speech = speech.set_channels(1).set_frame_rate(24000)
         speech_duration = len(speech) / 1000.0
-        source_duration = end - start
+        next_start = valid[i + 1][1] if i + 1 < len(valid) else video_duration
+        slot = max(0.05, next_start - start)
 
-        # Fit the picture to the NATURAL speech duration. Do not alter speech speed.
-        speech_video_path = os.path.join(work_dir, f"video_speech_{i:05d}.mp4")
-        make_video_piece(
-            video_path, start, source_duration, speech_duration, speech_video_path
-        )
-        video_pieces.append(speech_video_path)
-        audio_timeline += speech
-        source_cursor = end
-        used_count += 1
-        progress(0.55 + (i / len(valid)) * 0.45, f"Video အချိန်ကိုက်ညှိခြင်း ({i}/{len(valid)})")
+        # Edge TTS is already +10%. Add only enough pitch-preserving speed-up
+        # to fit the available slot, with a total speed ceiling of about +25%.
+        if speech_duration > slot + 0.04:
+            extra_atempo = min(speech_duration / slot, 1.136)
+            if extra_atempo > 1.001:
+                fitted_path = os.path.join(work_dir, f"speech_fit_{i+1:05d}.mp3")
+                run_command([
+                    "ffmpeg", "-y", "-i", speech_path,
+                    "-filter:a", f"atempo={extra_atempo:.5f}",
+                    "-vn", "-b:a", "192k", fitted_path,
+                ], "အသံအချိန်ကို သဘာဝကျအောင် ညှိခြင်း")
+                speech = AudioSegment.from_file(fitted_path, format="mp3")
+                speech = speech.set_channels(1).set_frame_rate(24000)
+                speech_duration = len(speech) / 1000.0
+            if speech_duration > slot + 0.08:
+                timing_warnings.append(
+                    f"{format_srt_timestamp(start)} မှ စာကြောင်းတစ်ကြောင်းသည် နောက် Timeline မတိုင်မီ မပြီးနိုင်ပါ။ စာသားတိုစေခြင်း သို့မဟုတ် နောက်အချိန်ကုဒ်ကို နောက်ရွှေ့ပါ။"
+                )
 
-    if source_cursor < video_duration - 0.02:
-        tail = video_duration - source_cursor
-        tail_path = os.path.join(work_dir, "video_tail.mp4")
-        make_video_piece(video_path, source_cursor, tail, tail, tail_path)
-        video_pieces.append(tail_path)
-        audio_timeline += AudioSegment.silent(
-            duration=int(tail * 1000), frame_rate=24000
-        ).set_channels(1)
-
-    if not video_pieces or used_count == 0:
-        raise RuntimeError("အသုံးပြုနိုင်တဲ့ စာတန်း/အသံ မတွေ့ပါ။")
-
-    # Re-encode-compatible MP4 pieces are joined in timeline order.
-    concat_file = os.path.join(work_dir, "video_concat.txt")
-    with open(concat_file, "w", encoding="utf-8") as f:
-        for piece in video_pieces:
-            escaped = piece.replace("'", r"'\''")
-            f.write(f"file '{escaped}'\n")
-
-    joined_video = os.path.join(work_dir, "joined_video.mp4")
-    run_command(
-        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
-         "-c", "copy", "-an", "-movflags", "+faststart", joined_video],
-        "Video အပိုင်းများ ပေါင်းစပ်ခြင်း",
-    )
+        position_ms = max(0, int(round(start * 1000)))
+        # Overlay speech at its absolute timestamp; all other positions stay silent.
+        audio_timeline = audio_timeline.overlay(speech, position=position_ms)
+        progress(0.55 + ((i + 1) / len(valid)) * 0.45,
+                 f"Timeline အသံချိန်ညှိခြင်း ({i+1}/{len(valid)})")
 
     mp3_output = os.path.join(work_dir, "dubbed_audio.mp3")
     audio_timeline.export(mp3_output, format="mp3", bitrate="192k")
-    output_duration = len(audio_timeline) / 1000.0
-    return joined_video, mp3_output, output_duration, used_count, fix_warnings
+    # Return the untouched source video so no scene or frame can disappear.
+    return video_path, mp3_output, video_duration, len(valid), fix_warnings + timing_warnings
 
 
 def mux_video(video_path: str, audio_path: str, output_path: str, duration: float):
@@ -582,7 +563,7 @@ txt_file = st.file_uploader("မြန်မာ TXT Script (ဥပမာ [0:00] 
 st.info(
     "လုပ်ဆောင်ပုံ — Gemini ဖြင့် Video မြင်ကွင်းနှင့် အသံကို နားလည်မည်။ Gemini မရပါက Whisper ဖြင့် အသံစာသားထုတ်ပြီး မြန်မာလို ပြန်ဆိုမည် → "
     "ရွေးချယ်ထားသော မြန်မာအသံထုတ်မည် → Video နှင့် အသံကို ပေါင်းစပ်မည်။ "
-    "TXT Timeline ရှိပါက အချိန်ကုဒ်အလိုက် အပိုင်းခွဲမည်။ မြန်မာအသံကို ပုံမှန်ထက် ၁၀% မြန်စေပြီး Video အပိုင်းကို အသံနှင့် ကိုက်ညီအောင် ညှိပါမည်။ စကားမရှိသည့်အချိန်တွင် အသံတိတ်ထားပါမည်။"
+    "TXT Timeline ရှိပါက အချိန်ကုဒ်တစ်ခုချင်းစီတွင် အသံစမည်။ Video မူရင်းအပိုင်းအားလုံးကို မဖြတ်မတောက် ထိန်းထားမည်။ မြန်မာအသံကို ပုံမှန်ထက် ၁၀% မြန်စေပြီး လိုအပ်လျှင် အများဆုံး ၂၅% ခန့်အထိသာ ထပ်မြန်ညှိမည်။ စကားမရှိသည့်အချိန်တွင် အသံတိတ်ထားမည်။"
 )
 
 if video_file:
