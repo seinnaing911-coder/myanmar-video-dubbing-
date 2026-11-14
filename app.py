@@ -4,7 +4,11 @@ import os
 import re
 import subprocess
 import tempfile
+import json
 from pathlib import Path
+
+from google import genai
+from google.genai import types
 
 import edge_tts
 import pysrt
@@ -19,6 +23,84 @@ st.set_page_config(
 
 VOICE = "my-MM-ThihaNeural"
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "500"))
+
+
+def get_gemini_key() -> str:
+    try:
+        value = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        value = ""
+    return str(value or os.getenv("GEMINI_API_KEY", "")).strip()
+
+
+def extract_audio(video_path: str, audio_path: str) -> None:
+    run_command([
+        "ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000",
+        "-b:a", "64k", audio_path,
+    ], "ဗီဒီယိုမှ အသံထုတ်ယူခြင်း")
+
+
+def transcribe_translate_video(video_path: str, srt_path: str, work_dir: str,
+                               progress) -> tuple[int, list[str]]:
+    """Transcribe short audio chunks, translate them, and write a temporary SRT."""
+    api_key = get_gemini_key()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY မတွေ့ပါ။ Streamlit Secrets ထဲတွင် ထည့်ပါ။")
+
+    client = genai.Client(api_key=api_key)
+    audio_path = os.path.join(work_dir, "source_audio.mp3")
+    extract_audio(video_path, audio_path)
+    audio = AudioSegment.from_file(audio_path).set_channels(1).set_frame_rate(16000)
+    total_ms = len(audio)
+    if total_ms <= 0:
+        raise RuntimeError("ဗီဒီယိုထဲတွင် အသံမတွေ့ပါ။")
+
+    chunk_ms = 15000
+    cues = []
+    warnings = []
+    total_chunks = (total_ms + chunk_ms - 1) // chunk_ms
+
+    for index, start_ms in enumerate(range(0, total_ms, chunk_ms), start=1):
+        end_ms = min(total_ms, start_ms + chunk_ms)
+        chunk_path = os.path.join(work_dir, f"audio_chunk_{index:04d}.mp3")
+        audio[start_ms:end_ms].export(chunk_path, format="mp3", bitrate="64k")
+        try:
+            audio_part = types.Part.from_bytes(
+                data=Path(chunk_path).read_bytes(), mime_type="audio/mpeg"
+            )
+            transcript_response = client.models.generate_content(
+                model="gemini-3.5-transcribe",
+                contents=["Transcribe all audible speech verbatim. Return only the spoken words. If there is no speech, return an empty response.", audio_part],
+            )
+            transcript = (transcript_response.text or "").strip()
+            if transcript:
+                translated_response = client.models.generate_content(
+                    model="gemini-3.8-flash",
+                    contents=[
+                        "Translate the following spoken dialogue into natural, concise Burmese (Myanmar). "
+                        "Keep names and meaning accurate. Return only the Burmese translation, no notes.\n\n"
+                        + transcript
+                    ],
+                )
+                translated = (translated_response.text or "").strip()
+                translated = re.sub(r"^```(?:text)?\s*|\s*```$", "", translated).strip()
+                if translated:
+                    cues.append((start_ms / 1000.0, end_ms / 1000.0, translated))
+                else:
+                    warnings.append(f"အပိုင်း {index}: ဘာသာပြန်စာသားမရပါ။")
+        except Exception as exc:
+            raise RuntimeError(
+                f"အသံအပိုင်း {index}/{total_chunks} ကို Gemini ဖြင့် မလုပ်နိုင်ပါ။ {exc}"
+            ) from exc
+        progress(index / total_chunks, f"အသံစစ်ဆေး/ဘာသာပြန်နေပါသည် ({index}/{total_chunks})")
+
+    if not cues:
+        raise RuntimeError("ပြောဆိုသံကို မတွေ့ပါ။ အသံပါတဲ့ ဗီဒီယိုကို တင်ကြည့်ပါ။")
+
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, (start, end, text) in enumerate(cues, start=1):
+            f.write(f"{i}\n{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}\n{text}\n\n")
+    return len(cues), warnings
 
 
 def check_login() -> bool:
@@ -283,82 +365,72 @@ def mux_video(video_path: str, audio_path: str, output_path: str, duration: floa
 
 check_login()
 
-st.title("🎬 Myanmar Video Dubbing Studio")
-st.caption("Thiha Neural မြန်မာအသံကို ပုံမှန်အမြန်နှုန်းထားပြီး Video အပိုင်းကိုသာ အချိန်ညှိပေးပါသည်။ SRT ကိုလည်း အလိုအလျောက် စစ်ဆေးပြင်ဆင်ပေးပါသည်။")
+st.title("🎬 Myanmar Auto Video Dubbing")
+st.caption("Video တစ်ခုတည်းတင်ပါ။ တရုတ် / အင်္ဂလိပ်အသံကို AI က စစ်ဆေးပြီး မြန်မာလို ပြန်ဆိုကာ Thiha Neural အသံဖြင့် ဒပ်ပေးပါမည်။")
 
 with st.sidebar:
     st.subheader("အသံဆက်တင်")
     st.info(f"Voice: {VOICE}")
-    st.caption(f"Upload ကန့်သတ်ချက်: {MAX_UPLOAD_MB} MB / ဖိုင်")
+    st.caption(f"Upload ကန့်သတ်ချက်: {MAX_UPLOAD_MB} MB")
+    st.caption("Gemini: 3.5 Transcribe + 3.8 Flash")
     if st.button("Logout", use_container_width=True):
         st.session_state["authenticated"] = False
         st.rerun()
 
-video_file = st.file_uploader("၁။ မူရင်းဗီဒီယို Upload လုပ်ပါ",
-                              type=["mp4", "mov", "mkv"])
-srt_file = st.file_uploader("၂။ မြန်မာဘာသာပြန်ပြီးသား SRT Upload လုပ်ပါ",
-                            type=["srt"])
+video_file = st.file_uploader("မူရင်းဗီဒီယို Upload လုပ်ပါ", type=["mp4", "mov", "mkv", "webm"])
 
 st.info(
-    "အသံကို အမြန်/အနှေး မပြောင်းပါ။ စာတန်းတစ်ကြောင်း၏ အသံကြာချိန်နှင့် "
-    "ကိုက်ညီစေရန် သက်ဆိုင်ရာ Video အပိုင်းကိုသာ အနှေး/အမြန် ပြောင်းပါမည်။ "
-    "ထို့ကြောင့် Output Video ကြာချိန်သည် မူရင်းထက် ပြောင်းလဲနိုင်ပါသည်။"
+    "လုပ်ဆောင်ပုံ — Video မှ အသံကို ထုတ်ယူမည် → Gemini ဖြင့် မူရင်းစကားကို သိရှိမည် → "
+    "မြန်မာလို ဘာသာပြန်မည် → Thiha Neural အသံထုတ်မည် → Video နှင့် အသံကို ပေါင်းစပ်မည်။ "
+    "အသံကို အမြန်/အနှေး မပြောင်းဘဲ Video အပိုင်းကိုသာ အသံနှင့် ကိုက်ညီအောင် ညှိပါမည်။"
 )
 
-if video_file and srt_file:
+if video_file:
     video_mb = video_file.size / (1024 * 1024)
-    srt_mb = srt_file.size / (1024 * 1024)
     st.write(f"Video: **{video_file.name}** ({video_mb:.1f} MB)")
-    st.write(f"SRT: **{srt_file.name}** ({srt_mb:.2f} MB)")
-
-    if video_mb > MAX_UPLOAD_MB or srt_mb > MAX_UPLOAD_MB:
-        st.error(f"ဖိုင်တစ်ဖိုင်ချင်းစီသည် {MAX_UPLOAD_MB} MB ထက် မကြီးရပါ။")
-    elif st.button("🚀 START DUBBING", type="primary", use_container_width=True):
+    if video_mb > MAX_UPLOAD_MB:
+        st.error(f"ဖိုင်သည် {MAX_UPLOAD_MB} MB ထက် မကြီးရပါ။")
+    elif st.button("🚀 START AUTO DUBBING", type="primary", use_container_width=True):
         status = st.empty()
         bar = st.progress(0)
         try:
-            with tempfile.TemporaryDirectory(prefix="myanmar_dub_") as work_dir:
+            with tempfile.TemporaryDirectory(prefix="myanmar_auto_dub_") as work_dir:
                 video_path = os.path.join(
                     work_dir, "source_video" + Path(video_file.name).suffix.lower()
                 )
-                srt_path = os.path.join(work_dir, "source_subtitle.srt")
+                srt_path = os.path.join(work_dir, "ai_translated.srt")
                 mp4_output = os.path.join(work_dir, "final_output.mp4")
-
                 with open(video_path, "wb") as f:
                     f.write(video_file.getbuffer())
-                with open(srt_path, "wb") as f:
-                    f.write(srt_file.getbuffer())
 
-                status.info("ဗီဒီယိုနှင့် SRT ကို စစ်ဆေးနေပါသည်...")
-                bar.progress(5)
+                status.info("၁။ မူရင်းအသံကို စစ်ဆေးပြီး မြန်မာလို ဘာသာပြန်နေပါသည်...")
+                def update_ai(value, message):
+                    bar.progress(max(1, min(55, int(value * 55))))
+                    status.info(message)
 
+                cue_count, ai_warnings = transcribe_translate_video(
+                    video_path, srt_path, work_dir, update_ai
+                )
+                status.info("၂။ Thiha Neural မြန်မာအသံနှင့် Video ကို အချိန်ကိုက် ပြုလုပ်နေပါသည်...")
                 def update_tts(value, message):
-                    bar.progress(min(65, 5 + int(value * 60)))
+                    bar.progress(min(90, 55 + int(value * 35)))
                     status.info(message)
 
                 joined_video, audio_path, duration, count, fix_warnings = make_dubbed_timeline(
                     video_path, srt_path, work_dir, update_tts
                 )
-                status.info("မြန်မာအသံနှင့် Video ကို ပေါင်းစပ်နေပါသည်...")
-                bar.progress(85)
+                status.info("၃။ နောက်ဆုံး MP4 ဖိုင်ကို ပေါင်းစပ်နေပါသည်...")
                 mux_video(joined_video, audio_path, mp4_output, duration)
                 bar.progress(100)
-                status.success(
-                    f"ပြီးပါပြီ။ စာတန်း {count} ကြောင်းကို ပုံမှန်အသံအမြန်နှုန်းဖြင့် ထုတ်ပြီးပါပြီ။"
-                )
-                if fix_warnings:
-                    with st.expander("🛠️ SRT Auto Check / Auto Fix မှတ်တမ်း"):
-                        st.warning("တွေ့ရှိသော SRT ပြဿနာများကို အလိုအလျောက် ပြင်ဆင်/ဖယ်ရှားထားပါသည်။")
-                        for warning in fix_warnings:
+                status.success(f"ပြီးပါပြီ။ မြန်မာအသံ {count} ပိုင်း ထုတ်လုပ်ပြီးပါပြီ။")
+                if ai_warnings or fix_warnings:
+                    with st.expander("လုပ်ဆောင်မှု မှတ်တမ်း"):
+                        for warning in ai_warnings + fix_warnings:
                             st.write("• " + warning)
-                else:
-                    st.success("SRT စာတန်းများကို စစ်ဆေးပြီး ပြဿနာမတွေ့ပါ။")
 
                 st.session_state["result_mp4"] = Path(mp4_output).read_bytes()
                 st.session_state["result_mp3"] = Path(audio_path).read_bytes()
                 st.session_state["result_name"] = Path(video_file.name).stem
-                st.session_state["result_duration"] = duration
-
         except Exception as exc:
             st.error("လုပ်ဆောင်မှု မအောင်မြင်ပါ။")
             st.exception(exc)
@@ -371,15 +443,13 @@ if st.session_state.get("result_mp4") and st.session_state.get("result_mp3"):
     base = st.session_state.get("result_name", "dubbed_video")
     col1, col2 = st.columns(2)
     with col1:
-        st.download_button("⬇️ Download MP4 Video",
-                           data=st.session_state["result_mp4"],
-                           file_name=f"{base}_myanmar_dub.mp4",
-                           mime="video/mp4", use_container_width=True)
+        st.download_button("⬇️ Download MP4 Video", data=st.session_state["result_mp4"],
+                           file_name=f"{base}_myanmar_dub.mp4", mime="video/mp4",
+                           use_container_width=True)
     with col2:
-        st.download_button("⬇️ Download MP3 Audio",
-                           data=st.session_state["result_mp3"],
-                           file_name=f"{base}_myanmar_dub.mp3",
-                           mime="audio/mpeg", use_container_width=True)
+        st.download_button("⬇️ Download MP3 Audio", data=st.session_state["result_mp3"],
+                           file_name=f"{base}_myanmar_dub.mp3", mime="audio/mpeg",
+                           use_container_width=True)
 
 st.divider()
 st.caption("ဖိုင်များကို ယာယီဖိုလ်ဒါတွင်သာ Process လုပ်ပြီး ပြီးဆုံးပါက ဖျက်ပစ်ပါသည်။")
