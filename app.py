@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 from google import genai
-from faster_whisper import WhisperModel
+from google.genai import types
 from deep_translator import GoogleTranslator
 
 import edge_tts
@@ -43,12 +43,6 @@ def extract_audio(video_path: str, audio_path: str) -> None:
         "-b:a", "64k", audio_path,
     ], "ဗီဒီယိုမှ အသံထုတ်ယူခြင်း")
 
-
-
-@st.cache_resource(show_spinner=False)
-def load_whisper_model():
-    # CPU/int8 ကိုသုံးသဖြင့် GPU မလိုပါ။ ပထမဆုံးအကြိမ် model download လုပ်ပါမည်။
-    return WhisperModel("tiny", device="cpu", compute_type="int8")
 
 
 def translate_to_burmese(text: str, client=None) -> tuple[str, str]:
@@ -96,65 +90,102 @@ def translate_to_burmese(text: str, client=None) -> tuple[str, str]:
 
 def transcribe_translate_video(video_path: str, srt_path: str, work_dir: str,
                                progress) -> tuple[int, list[str]]:
-    """Whisper Tiny ဖြင့် အသံနားထောင်စာသားထုတ်ပြီး မြန်မာလို ဘာသာပြန်ကာ SRT ရေးသည်။"""
+    """Gemini listens to audio chunks and returns Burmese SRT with timestamps."""
     audio_path = os.path.join(work_dir, "source_audio.mp3")
-    progress(0.02, "အသံထုတ်ယူခြင်း — ၁၀%")
+    progress(0.02, "အဆင့် ၁/၅ — Video မှ အသံထုတ်ယူခြင်း")
     extract_audio(video_path, audio_path)
-    progress(0.10, "အသံထုတ်ယူပြီးပါပြီ — ၁၀%")
+    progress(0.10, "အဆင့် ၁/၅ ပြီးပါပြီ — အသံထုတ်ယူပြီး")
+
+    api_key = get_gemini_key()
+    if not api_key:
+        raise RuntimeError("Streamlit Secrets ထဲတွင် GEMINI_API_KEY မတွေ့ပါ။")
+    client = genai.Client(api_key=api_key)
+
     audio = AudioSegment.from_file(audio_path).set_channels(1).set_frame_rate(16000)
     total_ms = len(audio)
     if total_ms <= 0:
         raise RuntimeError("ဗီဒီယိုထဲတွင် အသံမတွေ့ပါ။")
 
-    model = load_whisper_model()
-    api_key = get_gemini_key()
-    client = genai.Client(api_key=api_key) if api_key else None
-    chunk_ms = 30000
+    chunk_ms = 45000
     total_chunks = (total_ms + chunk_ms - 1) // chunk_ms
     cues = []
     warnings = []
 
     for index, start_ms in enumerate(range(0, total_ms, chunk_ms), start=1):
         end_ms = min(total_ms, start_ms + chunk_ms)
-        chunk_path = os.path.join(work_dir, f"whisper_chunk_{index:04d}.wav")
+        chunk_path = os.path.join(work_dir, f"gemini_audio_{index:04d}.wav")
         audio[start_ms:end_ms].export(chunk_path, format="wav")
-        try:
-            segments, info = model.transcribe(
-                chunk_path,
-                beam_size=1,
-                vad_filter=True,
-                condition_on_previous_text=False,
-            )
-            found_segments = list(segments)
-            for seg in found_segments:
-                original = (seg.text or "").strip()
-                if not original:
-                    continue
-                translated, note = translate_to_burmese(original, client)
-                if note and note not in warnings:
-                    warnings.append(note)
-                if translated:
-                    cue_start = start_ms / 1000.0 + float(seg.start)
-                    cue_end = start_ms / 1000.0 + float(seg.end)
-                    if cue_end > cue_start + 0.05:
-                        cues.append((cue_start, cue_end, translated))
-        except Exception as exc:
+        prompt = """Listen carefully to this audio. It contains spoken dialogue, mainly Chinese or English.
+Transcribe the dialogue accurately, translate every spoken line into natural conversational Burmese,
+and return ONLY valid SubRip SRT subtitles. Do not summarize or omit dialogue.
+Keep each subtitle short enough for dubbing. Preserve names and meaning.
+Timestamps must be relative to the beginning of THIS audio clip, in HH:MM:SS,mmm format.
+Use this exact format:
+1
+00:00:00,000 --> 00:00:02,500
+မြန်မာဘာသာပြန်စာသား
+
+2
+...
+If there is no speech, return an empty response. Do not use markdown fences."""
+        last_error = None
+        response_text = ""
+        for attempt in range(3):
+            try:
+                audio_bytes = Path(chunk_path).read_bytes()
+                response = client.models.generate_content(
+                    model="gemini-3.8-flash",
+                    contents=[prompt, types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")],
+                    config={"temperature": 0.1},
+                )
+                response_text = (response.text or "").strip()
+                if response_text:
+                    break
+                last_error = "Gemini မှ စာသားဗလာ ပြန်လာသည်။"
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt < 2:
+                    import time
+                    time.sleep(2 ** attempt)
+        if not response_text:
             raise RuntimeError(
-                f"အသံအပိုင်း {index}/{total_chunks} ကို Whisper ဖြင့် စာသားထုတ်/ဘာသာပြန်မရပါ။ {exc}"
-            ) from exc
-        progress(0.10 + (index / total_chunks) * 0.90,
-                 f"အဆင့် ၂/၅ — Whisper စာသားဖော်ထုတ်/ဘာသာပြန်ခြင်း ({index}/{total_chunks} အပိုင်း)")
+                f"အသံအပိုင်း {index}/{total_chunks} ကို Gemini ဖြင့် မလုပ်နိုင်ပါ။ {last_error}"
+            )
+
+        # Accept SRT output and a few common model formatting variations.
+        cleaned = re.sub(r"^```(?:srt|text)?\s*|\s*```$", "", response_text, flags=re.I).strip()
+        try:
+            parsed = pysrt.from_string(cleaned)
+        except Exception as exc:
+            raise RuntimeError(f"Gemini ထုတ်ပေးသော SRT အပိုင်း {index} ကို ဖတ်မရပါ။ {exc}\n{cleaned[:1200]}") from exc
+        if not parsed:
+            warnings.append(f"အသံအပိုင်း {index} တွင် စကားပြောသံ မတွေ့ပါ။")
+        for sub in parsed:
+            line = " ".join((sub.text or "").split()).strip()
+            local_start = srt_time_to_seconds(sub.start)
+            local_end = srt_time_to_seconds(sub.end)
+            if line and local_end > local_start + 0.05:
+                cues.append((start_ms / 1000.0 + local_start,
+                             start_ms / 1000.0 + local_end, line))
+        done = index / total_chunks
+        progress(0.10 + done * 0.45,
+                 f"အဆင့် ၂/၅ — Gemini အသံနားထောင်၊ စာသားထုတ်၊ မြန်မာပြန် ({index}/{total_chunks})")
 
     if not cues:
-        raise RuntimeError("ပြောဆိုသံကို မတွေ့ပါ။ အသံပါတဲ့ ဗီဒီယိုကို တင်ကြည့်ပါ။")
+        raise RuntimeError("Gemini က အသုံးပြုနိုင်တဲ့ စကားပြောစာသား မတွေ့ပါ။ အသံပါတဲ့ Video ကို စမ်းကြည့်ပါ။")
 
     cues.sort(key=lambda x: (x[0], x[1]))
-    # SRT အချိန်များ ထပ်မတိုးစေရန် အစဉ်လိုက်ရေးသည်။
+    # Remove overlaps introduced at chunk boundaries.
+    normalized = []
+    for start, end, text in cues:
+        if normalized and start < normalized[-1][1]:
+            start = normalized[-1][1]
+        if end > start + 0.05:
+            normalized.append((start, end, text))
     with open(srt_path, "w", encoding="utf-8") as f:
-        for i, (start, end, text) in enumerate(cues, start=1):
+        for i, (start, end, text) in enumerate(normalized, start=1):
             f.write(f"{i}\n{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}\n{text}\n\n")
-    return len(cues), warnings
-
+    return len(normalized), warnings
 
 def check_login() -> bool:
     expected = str(st.secrets.get("APP_PASSWORD", os.getenv("APP_PASSWORD", ""))).strip()
@@ -426,7 +457,7 @@ with st.sidebar:
     st.subheader("အသံဆက်တင်")
     st.caption("မြန်မာအသံရွေးချယ်မှုကို အောက်တွင် ပြုလုပ်နိုင်ပါသည်။")
     st.caption(f"Upload ကန့်သတ်ချက်: {MAX_UPLOAD_MB} MB")
-    st.caption("အသံစာသားထုတ်ယူခြင်း: Whisper Tiny (CPU)\nဘာသာပြန်: Gemini ရှိလျှင် Gemini၊ မရှိလျှင် Google Translate")
+    st.caption("အသံစာသားထုတ်ယူခြင်းနှင့် မြန်မာဘာသာပြန်ခြင်း: Gemini AI")
     if st.button("Logout", use_container_width=True):
         st.session_state["authenticated"] = False
         st.rerun()
@@ -437,8 +468,8 @@ selected_voice = VOICES[selected_voice_label]
 video_file = st.file_uploader("မူရင်းဗီဒီယို Upload လုပ်ပါ", type=["mp4", "mov", "mkv", "webm"])
 
 st.info(
-    "လုပ်ဆောင်ပုံ — Video မှ အသံကို ထုတ်ယူမည် → Whisper ဖြင့် မူရင်းစကားကို စာသားထုတ်မည် → "
-    "မြန်မာလို ဘာသာပြန်မည် → ရွေးချယ်ထားသော မြန်မာအသံထုတ်မည် → Video နှင့် အသံကို ပေါင်းစပ်မည်။ "
+    "လုပ်ဆောင်ပုံ — Video မှ အသံထုတ်ယူမည် → Gemini AI က နားထောင်၊ စာသားထုတ်ပြီး မြန်မာလို ပြန်ဆိုမည် → "
+    "ရွေးချယ်ထားသော မြန်မာအသံထုတ်မည် → Video နှင့် အသံကို ပေါင်းစပ်မည်။ "
     "အသံကို အမြန်/အနှေး မပြောင်းဘဲ Video အပိုင်းကိုသာ အသံနှင့် ကိုက်ညီအောင် ညှိပါမည်။"
 )
 
