@@ -10,6 +10,7 @@ from pathlib import Path
 from google import genai
 from google.genai import types
 from deep_translator import GoogleTranslator
+from faster_whisper import WhisperModel
 
 import edge_tts
 import pysrt
@@ -98,23 +99,74 @@ def _seconds(value) -> float:
     return parse_srt_timestamp(text)
 
 
+@st.cache_resource(show_spinner=False)
+def load_whisper_model():
+    """Load a small CPU Whisper model once per Streamlit process."""
+    return WhisperModel("tiny", device="cpu", compute_type="int8")
+
+
+def whisper_transcribe_translate(video_path: str, srt_path: str, work_dir: str, progress):
+    """Reliable local ASR fallback; does not require a Gemini API key."""
+    audio_path = os.path.join(work_dir, "whisper_input.wav")
+    extract_audio(video_path, audio_path)
+    progress(0.18, "Whisper က အသံကို နားထောင်ပြီး စာသားထုတ်နေသည်")
+    model = load_whisper_model()
+    segments, info = model.transcribe(
+        audio_path, beam_size=1, vad_filter=True, word_timestamps=False
+    )
+    raw = []
+    for seg in segments:
+        text = (seg.text or "").strip()
+        if text and seg.end > seg.start:
+            raw.append({"start": float(seg.start), "end": float(seg.end),
+                        "speaker": "Speaker", "original_text": text})
+    if not raw:
+        raise RuntimeError("Whisper က အသံထဲတွင် စကားပြောစာသား မတွေ့ပါ။")
+
+    cues = []
+    warnings = ["Gemini Video Understanding မအောင်မြင်သဖြင့် Whisper အသံစာသားထုတ်စနစ်ကို အသုံးပြုထားသည်။",
+                "Gemini မရသဖြင့် မြင်ကွင်းဖော်ပြချက် မရရှိပါ။"]
+    total = len(raw)
+    for i, item in enumerate(raw, start=1):
+        try:
+            translated, note = translate_to_burmese(item["original_text"], client=None)
+        except Exception as exc:
+            translated = item["original_text"]
+            warnings.append(f"စာကြောင်း {i} ကို ဘာသာပြန်မရပါ: {exc}")
+        item["burmese_text"] = translated
+        cues.append((item["start"], item["end"], translated))
+        progress(0.20 + (i / total) * 0.78,
+                 f"Whisper စာသားကို မြန်မာလို ပြန်ဆိုနေသည် ({i}/{total})")
+
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, (start, end, line) in enumerate(cues, start=1):
+            f.write(f"{i}\n{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}\n{line}\n\n")
+    analysis = {
+        "video_summary_my": "Gemini မရရှိသဖြင့် Video မြင်ကွင်းအကျဉ်းချုပ် မထုတ်နိုင်ပါ။ အသံစာသားကို Whisper ဖြင့် ထုတ်ထားသည်။",
+        "scenes": [], "segments": raw,
+        "transcription_method": "Whisper local fallback",
+    }
+    Path(os.path.join(work_dir, "video_analysis.json")).write_text(
+        json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return len(cues), warnings, analysis
+
+
 def transcribe_translate_video(video_path: str, srt_path: str, work_dir: str,
                                progress) -> tuple[int, list[str], dict]:
-    """Upload the complete video once; Gemini understands visuals + dialogue in one request."""
+    """Prefer Gemini full-video understanding; fall back to local Whisper + translation."""
     api_key = get_gemini_key()
     if not api_key:
-        raise RuntimeError("Streamlit Secrets ထဲတွင် GEMINI_API_KEY မတွေ့ပါ။")
+        progress(0.05, "Gemini API Key မတွေ့ပါ — Whisper ကို အသုံးပြုမည်")
+        return whisper_transcribe_translate(video_path, srt_path, work_dir, progress)
 
     client = genai.Client(api_key=api_key)
     uploaded_file = None
-    warnings = []
-    progress(0.03, "အဆင့် ၁/၅ — Video တစ်ခုလုံးကို Gemini သို့ တင်နေသည်")
     try:
+        progress(0.03, "အဆင့် ၁/၅ — Video တစ်ခုလုံးကို Gemini သို့ တင်နေသည်")
         uploaded_file = client.files.upload(file=video_path)
         if not getattr(uploaded_file, "name", None) or not getattr(uploaded_file, "uri", None):
             raise RuntimeError("Gemini File API မှ Video ဖိုင်အချက်အလက် မရရှိပါ။")
-
-        # Gemini needs the uploaded video to become ACTIVE before analysis.
         import time
         max_wait_seconds = 15 * 60
         waited = 0
@@ -124,65 +176,30 @@ def transcribe_translate_video(video_path: str, srt_path: str, work_dir: str,
             if "ACTIVE" in state_name:
                 break
             if "FAILED" in state_name:
-                raise RuntimeError("Gemini က Video ကို ပြင်ဆင်မရပါ။ MP4 ဖိုင်ဖြင့် ထပ်စမ်းကြည့်ပါ။")
+                raise RuntimeError("Gemini က Video ကို ပြင်ဆင်မရပါ။")
             if waited >= max_wait_seconds:
                 raise RuntimeError("Gemini Video ပြင်ဆင်ချိန် ၁၅ မိနစ်ကျော်သွားပါသည်။")
             progress(min(0.20, 0.08 + (waited / max_wait_seconds) * 0.12),
-                     f"အဆင့် ၁/၅ — Gemini က Video ကို ပြင်ဆင်နေသည် ({waited // 5 + 1})")
+                     f"Gemini က Video ကို ပြင်ဆင်နေသည် ({waited // 5 + 1})")
             time.sleep(5)
             waited += 5
             uploaded_file = client.files.get(name=uploaded_file.name)
 
         progress(0.25, "အဆင့် ၂/၅ — Gemini AI က Video မြင်ကွင်းနှင့် အသံကို စစ်ဆေးနေသည်")
         prompt = r"""You are an expert video understanding, transcription, and Burmese dubbing assistant.
-Analyze the ENTIRE uploaded video, not just a short excerpt. Understand both the visual scenes and the audio.
-The spoken language is mainly Chinese or English. Produce natural conversational Burmese suitable for dubbing.
-
-Return ONLY valid JSON with this exact structure:
-{
-  "video_summary_my": "A concise Burmese summary of the whole video and its story/context",
-  "scenes": [
-    {"start": 0.0, "end": 5.0, "description_my": "What is visibly happening in this scene, in Burmese"}
-  ],
-  "segments": [
-    {"start": 0.0, "end": 2.5, "speaker": "Speaker 1", "original_text": "Original spoken words", "burmese_text": "Natural Burmese translation"}
-  ]
-}
-
-Rules:
-- Inspect the whole video from beginning to end. Do not invent unseen events.
-- Transcribe every audible spoken line. Do not summarize dialogue and do not omit short lines.
-- Include only speech that can be heard. Do not create dialogue from subtitles or visual context alone.
-- Preserve the original language words in original_text and translate the meaning into natural Burmese in burmese_text.
-- Use seconds from the beginning of the video for start and end. Use decimal seconds (example: 12.35).
-- Timestamps must follow the actual speech timing. Each end must be later than its start.
-- Keep each segment short (usually one sentence or phrase) for dubbing.
-- Identify speakers consistently as Speaker 1, Speaker 2, etc. If uncertain, use Speaker.
-- In scenes, give a concise description of important visual actions, characters, and scene changes. Do not make a separate scene for every frame.
-- If there is no speech, return an empty segments array.
-- JSON only. No Markdown fences and no extra explanation."""
-
-        progress(0.35, "အဆင့် ၂/၅ — Gemini က Video တစ်ခုလုံးကို နားလည်ပြီး စာသားထုတ်နေသည်")
+Analyze the ENTIRE uploaded video from beginning to end, understanding both visual scenes and audio.
+Return ONLY valid JSON:
+{"video_summary_my":"Burmese summary","scenes":[{"start":0.0,"end":5.0,"description_my":"Burmese visual description"}],"segments":[{"start":0.0,"end":2.5,"speaker":"Speaker 1","original_text":"Original spoken words","burmese_text":"Natural Burmese translation"}]}
+Transcribe every audible spoken line without omissions. Do not invent dialogue from subtitles or visuals. Use accurate timestamps in seconds. Keep segments short for dubbing. Identify speakers consistently. Describe important visual actions and scene changes. JSON only."""
         response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=[prompt, uploaded_file],
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                response_mime_type="application/json",
-            ),
+            model="gemini-3.8-flash", contents=[prompt, uploaded_file],
+            config=types.GenerateContentConfig(temperature=0.1, response_mime_type="application/json"),
         )
         response_text = (response.text or "").strip()
         if not response_text:
             raise RuntimeError("Gemini မှ Video analysis စာသားဗလာ ပြန်လာပါသည်။")
         response_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", response_text, flags=re.I).strip()
-        try:
-            analysis = json.loads(response_text)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "Gemini ရဲ့ Video analysis JSON ကို ဖတ်မရပါ။ Video အလွန်ရှည်နေနိုင်ပါတယ်။\n"
-                + response_text[:1500]
-            ) from exc
-
+        analysis = json.loads(response_text)
         raw_segments = analysis.get("segments", [])
         cues = []
         for item in raw_segments:
@@ -193,11 +210,9 @@ Rules:
                 if line and end > start + 0.05:
                     cues.append((start, end, line))
             except Exception:
-                warnings.append("အချိန်ပုံစံမမှန်သော စာကြောင်းတစ်ခုကို ကျော်ထားသည်။")
-
+                pass
         if not cues:
-            raise RuntimeError("Gemini က Video ထဲတွင် အသုံးပြုနိုင်သော စကားပြောစာသား မတွေ့ပါ။")
-
+            raise RuntimeError("Gemini က အသုံးပြုနိုင်သော စကားပြောစာသား မတွေ့ပါ။")
         cues.sort(key=lambda x: (x[0], x[1]))
         normalized = []
         for start, end, line in cues:
@@ -205,29 +220,29 @@ Rules:
                 start = normalized[-1][1]
             if end > start + 0.05:
                 normalized.append((start, end, line))
-
         with open(srt_path, "w", encoding="utf-8") as f:
             for i, (start, end, line) in enumerate(normalized, start=1):
                 f.write(f"{i}\n{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}\n{line}\n\n")
-
-        # Keep a user-readable transcript with original speech, Burmese translation and scene notes.
         analysis["segments"] = [
-            {
-                "start": item.get("start"),
-                "end": item.get("end"),
-                "speaker": item.get("speaker", "Speaker"),
-                "original_text": item.get("original_text", ""),
-                "burmese_text": item.get("burmese_text", ""),
-            }
-            for item in raw_segments
+            {"start": x.get("start"), "end": x.get("end"), "speaker": x.get("speaker", "Speaker"),
+             "original_text": x.get("original_text", ""), "burmese_text": x.get("burmese_text", "")}
+            for x in raw_segments
         ]
+        analysis["transcription_method"] = "Gemini full video understanding"
         Path(os.path.join(work_dir, "video_analysis.json")).write_text(
             json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        progress(1.0, f"အဆင့် ၂/၅ ပြီးပါပြီ — Video နားလည်၊ စာသားထုတ်ပြီး ({len(normalized)} ပိုင်း)")
-        return len(normalized), warnings, analysis
+        progress(1.0, f"Gemini Video analysis ပြီးပါပြီ ({len(normalized)} ပိုင်း)")
+        return len(normalized), [], analysis
+    except Exception as gemini_error:
+        # A temporary 503/429 or other API failure must not stop dubbing.
+        progress(0.08, "Gemini မရရှိပါ — Whisper ဖြင့် အသံစာသားကို ဆက်ထုတ်နေသည်")
+        count, warnings, analysis = whisper_transcribe_translate(
+            video_path, srt_path, work_dir, progress
+        )
+        warnings.insert(0, f"Gemini API ပြဿနာကြောင့် fallback သုံးထားသည်: {str(gemini_error)[:350]}")
+        return count, warnings, analysis
     finally:
-        # Remove uploaded source from Gemini storage after processing when possible.
         if uploaded_file is not None and getattr(uploaded_file, "name", None):
             try:
                 client.files.delete(name=uploaded_file.name)
@@ -498,13 +513,13 @@ def mux_video(video_path: str, audio_path: str, output_path: str, duration: floa
 check_login()
 
 st.title("🎬 Myanmar Auto Video Dubbing")
-st.caption("Video တစ်ခုတည်းတင်ပါ။ Gemini AI က မြင်ကွင်းနှင့် အသံကို တစ်ပြိုင်နက်နားလည်၊ စာသားထုတ်၊ မြန်မာလိုပြန်ဆိုပြီး Dubbing လုပ်ပေးပါမည်။")
+st.caption("Video တစ်ခုတည်းတင်ပါ။ Gemini က မြင်ကွင်းနှင့်အသံကို နားလည်မည်။ Gemini မရပါက Whisper က အသံစာသားထုတ်ပြီး မြန်မာလိုပြန်ဆိုကာ Dubbing ဆက်လုပ်မည်။")
 
 with st.sidebar:
     st.subheader("အသံဆက်တင်")
     st.caption("မြန်မာအသံရွေးချယ်မှုကို အောက်တွင် ပြုလုပ်နိုင်ပါသည်။")
     st.caption(f"Upload ကန့်သတ်ချက်: {MAX_UPLOAD_MB} MB")
-    st.caption("Video မြင်ကွင်း + အသံနားလည်ခြင်း: Gemini AI")
+    st.caption("Gemini Video Understanding + Whisper အရန်အသံစာသားထုတ်စနစ်")
     if st.button("Logout", use_container_width=True):
         st.session_state["authenticated"] = False
         st.rerun()
@@ -515,7 +530,7 @@ selected_voice = VOICES[selected_voice_label]
 video_file = st.file_uploader("မူရင်းဗီဒီယို Upload လုပ်ပါ", type=["mp4", "mov", "mkv", "webm"])
 
 st.info(
-    "လုပ်ဆောင်ပုံ — Video တစ်ခုလုံးကို Gemini သို့ တင်မည် → မြင်ကွင်းနှင့် အသံကို နားလည်၊ စကားပြောစာသားထုတ်ပြီး မြန်မာလို ပြန်ဆိုမည် → "
+    "လုပ်ဆောင်ပုံ — Gemini ဖြင့် Video မြင်ကွင်းနှင့် အသံကို နားလည်မည်။ Gemini မရပါက Whisper ဖြင့် အသံစာသားထုတ်ပြီး မြန်မာလို ပြန်ဆိုမည် → "
     "ရွေးချယ်ထားသော မြန်မာအသံထုတ်မည် → Video နှင့် အသံကို ပေါင်းစပ်မည်။ "
     "အသံကို အမြန်/အနှေး မပြောင်းဘဲ Video အပိုင်းကိုသာ အသံနှင့် ကိုက်ညီအောင် ညှိပါမည်။"
 )
