@@ -249,6 +249,72 @@ Transcribe every audible spoken line without omissions. Do not invent dialogue f
             except Exception:
                 pass
 
+
+def apply_burmese_script(script_text: str, analysis: dict, srt_path: str) -> int:
+    """Use the supplied Burmese script with speech timestamps detected from the video.
+    Text is divided across detected speech segments; the Burmese TTS speed is unchanged.
+    """
+    script_text = script_text.replace("\ufeff", "").strip()
+    if not script_text:
+        raise RuntimeError("တင်ထားသော TXT Script ထဲတွင် စာသားမရှိပါ။")
+
+    segments = analysis.get("segments", []) if isinstance(analysis, dict) else []
+    timed = []
+    for seg in segments:
+        try:
+            start = max(0.0, _seconds(seg.get("start", 0)))
+            end = _seconds(seg.get("end", 0))
+            if end > start + 0.05:
+                timed.append((start, end))
+        except Exception:
+            continue
+    timed.sort(key=lambda x: x[0])
+    if not timed:
+        raise RuntimeError("Video ထဲမှ စကားပြောချိန် မရရှိပါ။ Script ကို အချိန်နှင့် ချိတ်ဆက်မရပါ။")
+
+    # If the user wrote one script paragraph per detected speech segment, keep it.
+    lines = [re.sub(r"\s+", " ", x).strip() for x in script_text.splitlines() if x.strip()]
+    if len(lines) == len(timed):
+        chunks = lines
+    else:
+        # Split the complete script into the same number of timed chunks by character
+        # weight, preserving the original order and avoiding empty chunks.
+        compact = re.sub(r"\s+", " ", script_text).strip()
+        chunks = []
+        pos = 0
+        total_chars = len(compact)
+        for i in range(len(timed)):
+            remaining_chunks = len(timed) - i
+            if i == len(timed) - 1:
+                end_pos = total_chars
+            else:
+                target = pos + max(1, round((total_chars - pos) / remaining_chunks))
+                end_pos = min(total_chars, target)
+                # Prefer a nearby space so Burmese/Latin words are not cut in half.
+                if " " in compact[pos:end_pos + 30]:
+                    candidates = [m.start() + pos for m in re.finditer(" ", compact[pos:min(total_chars, end_pos + 30)])]
+                    if candidates:
+                        end_pos = min(candidates, key=lambda x: abs(x - target))
+                end_pos = max(pos + 1, end_pos)
+            chunk = compact[pos:end_pos].strip()
+            chunks.append(chunk)
+            pos = end_pos
+        # Merge any remainder into the final cue.
+        if pos < total_chars:
+            chunks[-1] = (chunks[-1] + " " + compact[pos:]).strip()
+
+    cues = []
+    for (start, end), line in zip(timed, chunks):
+        line = line.strip()
+        if line:
+            cues.append((start, end, line))
+    if not cues:
+        raise RuntimeError("TXT Script ကို အချိန်ပိုင်းခွဲ၍ မရပါ။")
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, (start, end, line) in enumerate(cues, start=1):
+            f.write(f"{i}\n{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}\n{line}\n\n")
+    return len(cues)
+
 def check_login() -> bool:
     expected = str(st.secrets.get("APP_PASSWORD", os.getenv("APP_PASSWORD", ""))).strip()
     if not expected:
@@ -513,7 +579,7 @@ def mux_video(video_path: str, audio_path: str, output_path: str, duration: floa
 check_login()
 
 st.title("🎬 Myanmar Auto Video Dubbing")
-st.caption("Video တစ်ခုတည်းတင်ပါ။ Gemini က မြင်ကွင်းနှင့်အသံကို နားလည်မည်။ Gemini မရပါက Whisper က အသံစာသားထုတ်ပြီး မြန်မာလိုပြန်ဆိုကာ Dubbing ဆက်လုပ်မည်။")
+st.caption("Video တစ်ခုတင်ပါ။ လိုအပ်ပါက မြန်မာ TXT Script ကိုပါ တင်နိုင်သည်။ AI က Video ထဲမှ စကားပြောချိန်များကို ရှာပြီး Script ကို အချိန်နှင့် ချိတ်ဆက်ကာ Dubbing လုပ်ပေးမည်။")
 
 with st.sidebar:
     st.subheader("အသံဆက်တင်")
@@ -528,9 +594,10 @@ selected_voice_label = st.selectbox("🎙️ မြန်မာအသံရွ�
 selected_voice = VOICES[selected_voice_label]
 
 video_file = st.file_uploader("မူရင်းဗီဒီယို Upload လုပ်ပါ", type=["mp4", "mov", "mkv", "webm"])
+script_file = st.file_uploader("မြန်မာ Script (TXT) — မထည့်လည်း ရပါသည်", type=["txt"], help="TXT စာသားကို Video ထဲက စကားပြောအစဉ်အတိုင်း ရေးထားပါ။")
 
 st.info(
-    "လုပ်ဆောင်ပုံ — Gemini ဖြင့် Video မြင်ကွင်းနှင့် အသံကို နားလည်မည်။ Gemini မရပါက Whisper ဖြင့် အသံစာသားထုတ်ပြီး မြန်မာလို ပြန်ဆိုမည် → "
+    "လုပ်ဆောင်ပုံ — Gemini ဖြင့် Video မြင်ကွင်းနှင့် အသံကို နားလည်မည်။ မြန်မာ TXT Script တင်ထားပါက ထို Script ကို အသုံးပြုမည်။ မတင်ထားပါက အသံစာသားကို မြန်မာလို ပြန်ဆိုမည် → "
     "ရွေးချယ်ထားသော မြန်မာအသံထုတ်မည် → Video နှင့် အသံကို ပေါင်းစပ်မည်။ "
     "အသံကို အမြန်/အနှေး မပြောင်းဘဲ Video အပိုင်းကိုသာ အသံနှင့် ကိုက်ညီအောင် ညှိပါမည်။"
 )
@@ -563,6 +630,13 @@ if video_file:
                 cue_count, ai_warnings, video_analysis = transcribe_translate_video(
                     video_path, srt_path, work_dir, update_ai
                 )
+                if script_file is not None:
+                    try:
+                        supplied_script = script_file.getvalue().decode("utf-8-sig")
+                    except UnicodeDecodeError:
+                        supplied_script = script_file.getvalue().decode("utf-8", errors="replace")
+                    script_cues = apply_burmese_script(supplied_script, video_analysis, srt_path)
+                    ai_warnings.append(f"အသုံးပြုသူတင်ထားသော မြန်မာ TXT Script ကို အသုံးပြုပြီး {script_cues} ပိုင်းအဖြစ် Video စကားပြောချိန်နှင့် ချိတ်ဆက်ထားသည်။")
                 st.session_state["video_analysis"] = video_analysis
                 status.info("အဆင့် ၃/၅ — ရွေးချယ်ထားသော မြန်မာအသံ ဖန်တီးခြင်း (၅၅% မှ ၇၇%)")
                 def update_tts(value, message):
