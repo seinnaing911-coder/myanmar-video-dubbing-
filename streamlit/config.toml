@@ -1,0 +1,8 @@
+[server]
+maxUploadSize = 500
+
+[server.enableCORS]
+enabled = true
+
+[server.enableXsrfProtection]
+enabled = true
