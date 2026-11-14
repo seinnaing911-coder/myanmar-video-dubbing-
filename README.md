@@ -1,44 +1,25 @@
-# Myanmar Video Dubbing Studio
+# Myanmar Auto Dubbing Studio
 
-Private/password-gated Streamlit app for generating Burmese Thiha Neural dubbing from an uploaded video and SRT file.
+Upload one MP4/MOV/MKV/WEBM video. The app automatically detects speech language (intended for Chinese or English) with Whisper, translates segments to Burmese using Gemini, generates Burmese speech with Edge TTS, and retimes video segments to fit the natural TTS duration. It exports MP4 and MP3.
 
-## Files
-- `app.py`: Streamlit application
-- `requirements.txt`: Python packages
-- `packages.txt`: system package (FFmpeg) for Streamlit Community Cloud
-- `.streamlit/config.toml`: upload size setting
+## Streamlit Community Cloud setup
 
-## Run locally
-1. Install FFmpeg and make sure `ffmpeg` and `ffprobe` are available on PATH.
-2. Install Python 3.10+.
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Create `.streamlit/secrets.toml`:
-   ```toml
-   APP_PASSWORD = "replace-with-a-long-private-password"
-   ```
-5. Run:
-   ```bash
-   streamlit run app.py
-   ```
+1. Replace repository `app.py` with this version.
+2. Replace `requirements.txt` with the supplied version.
+3. Keep `packages.txt` containing `ffmpeg` and keep `.streamlit/config.toml`.
+4. In Streamlit app Settings -> Secrets, keep your existing password and add your Gemini API key:
 
-## Deploy to Streamlit Community Cloud
-1. Create a GitHub repository and upload these files. Do NOT upload `secrets.toml`.
-2. Create an app at https://share.streamlit.io/ and select this repository and `app.py`.
-3. In the app's Advanced settings / Secrets, add:
-   ```toml
-   APP_PASSWORD = "replace-with-a-long-private-password"
-   ```
-4. Deploy and open the app URL. Enter the password to use it.
+```toml
+APP_PASSWORD = "your-existing-password"
+GEMINI_API_KEY = "your-gemini-api-key"
+```
 
-## Privacy warning
-The password gate protects the app interface, but Streamlit Community Cloud apps are not equivalent to a fully private server. The GitHub repository used for Community Cloud should be public, so the source code can be viewed. Do not upload private videos or sensitive content unless you accept the hosting provider's terms and data handling. For strict private hosting, use a private server/VPS or a Hugging Face private Space; these may have hosting costs. Do not commit `.streamlit/secrets.toml`.
+Do not put API keys in app.py or commit them to GitHub.
 
 ## Notes
-- Original video audio is replaced by the generated Burmese voice.
-- Audio is placed at the SRT timestamps. Empty gaps remain silent.
-- If speech is longer than its subtitle slot, FFmpeg `atempo` speeds it up without intentionally changing pitch; very long lines may still sound fast.
-- Streamlit Community Cloud has resource, upload, processing-time and temporary-storage limits. Large videos may fail. For larger videos, run locally or use a server with more RAM/disk/CPU.
-- Edge TTS requires outbound internet access.
+
+- SRT upload is no longer required.
+- Whisper `base` multilingual model is downloaded on first run and uses CPU int8.
+- The first run may be slow; Streamlit Community Cloud memory/CPU limits may constrain long videos.
+- Translation requires a valid Gemini API key and may incur API charges.
+- Automatic speech segmentation is approximate; overlapping speakers, music, noisy audio, and very fast speech can reduce accuracy.
