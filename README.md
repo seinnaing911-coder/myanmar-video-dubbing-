@@ -1,11 +1,15 @@
-# Myanmar Auto Video Dubbing
+# Myanmar Auto Video Dubbing — Full Video Understanding
 
-Upload one video. Gemini 3.5 Transcribe detects and transcribes the source speech, Gemini 3.8 Flash translates it into Burmese, and Microsoft Edge TTS `my-MM-ThihaNeural` creates the Burmese voice. FFmpeg assembles the dubbed MP4.
+Upload one video. Gemini uploads and analyzes the complete video (visual scenes + spoken audio) in one model request, returns timestamped original dialogue and Burmese translations, and produces a Burmese voice dub with Thiha or Nilar.
 
-## Streamlit Community Cloud
-- Main file: `app.py`
-- Keep the existing `APP_PASSWORD` secret.
-- Add `GEMINI_API_KEY = "your Gemini API key"` to App settings → Secrets.
-- Do not share the API key publicly.
+## Streamlit Secrets
+Keep your existing values:
 
-The app processes audio in 15-second chunks to reduce request size.
+```toml
+APP_PASSWORD = "your-existing-password"
+GEMINI_API_KEY = "your-gemini-api-key"
+```
+
+The app uses the Gemini Files API for the uploaded video, waits until processing is complete, then analyzes the video. It attempts to delete the temporary Gemini file after analysis.
+
+Free-tier limits still apply. A new API key in the same Google Cloud project does not reset project quota.
