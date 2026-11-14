@@ -22,7 +22,10 @@ st.set_page_config(
     layout="centered",
 )
 
-VOICE = "my-MM-ThihaNeural"
+VOICES = {
+    "Thiha (အမျိုးသားအသံ)": "my-MM-ThihaNeural",
+    "Nilar (အမျိုးသမီးအသံ)": "my-MM-NilarNeural",
+}
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "500"))
 
 
@@ -95,7 +98,9 @@ def transcribe_translate_video(video_path: str, srt_path: str, work_dir: str,
                                progress) -> tuple[int, list[str]]:
     """Whisper Tiny ဖြင့် အသံနားထောင်စာသားထုတ်ပြီး မြန်မာလို ဘာသာပြန်ကာ SRT ရေးသည်။"""
     audio_path = os.path.join(work_dir, "source_audio.mp3")
+    progress(0.02, "အသံထုတ်ယူခြင်း — ၁၀%")
     extract_audio(video_path, audio_path)
+    progress(0.10, "အသံထုတ်ယူပြီးပါပြီ — ၁၀%")
     audio = AudioSegment.from_file(audio_path).set_channels(1).set_frame_rate(16000)
     total_ms = len(audio)
     if total_ms <= 0:
@@ -137,8 +142,8 @@ def transcribe_translate_video(video_path: str, srt_path: str, work_dir: str,
             raise RuntimeError(
                 f"အသံအပိုင်း {index}/{total_chunks} ကို Whisper ဖြင့် စာသားထုတ်/ဘာသာပြန်မရပါ။ {exc}"
             ) from exc
-        progress(index / total_chunks,
-                 f"Whisper အသံနားထောင်ပြီး စာသားထုတ်/ဘာသာပြန်နေပါသည် ({index}/{total_chunks})")
+        progress(0.10 + (index / total_chunks) * 0.90,
+                 f"အဆင့် ၂/၅ — Whisper စာသားဖော်ထုတ်/ဘာသာပြန်ခြင်း ({index}/{total_chunks} အပိုင်း)")
 
     if not cues:
         raise RuntimeError("ပြောဆိုသံကို မတွေ့ပါ။ အသံပါတဲ့ ဗီဒီယိုကို တင်ကြည့်ပါ။")
@@ -200,8 +205,8 @@ def get_media_duration(path: str) -> float:
     return duration
 
 
-async def create_tts(text: str, destination: str) -> None:
-    communicator = edge_tts.Communicate(text=text, voice=VOICE)
+async def create_tts(text: str, destination: str, voice: str) -> None:
+    communicator = edge_tts.Communicate(text=text, voice=voice)
     await communicator.save(destination)
 
 
@@ -302,7 +307,7 @@ def auto_fix_srt(source_path: str, fixed_path: str, video_duration: float):
     return cue_count, list(dict.fromkeys(warnings))
 
 
-def make_dubbed_timeline(video_path: str, srt_path: str, work_dir: str, progress):
+def make_dubbed_timeline(video_path: str, srt_path: str, work_dir: str, voice: str, progress):
     video_duration = get_media_duration(video_path)
     fixed_srt_path = os.path.join(work_dir, 'auto_fixed_subtitles.srt')
     fixed_count, fix_warnings = auto_fix_srt(srt_path, fixed_srt_path, video_duration)
@@ -325,9 +330,9 @@ def make_dubbed_timeline(video_path: str, srt_path: str, work_dir: str, progress
         paths = []
         for i, (line, _, _) in enumerate(valid, start=1):
             audio_path = os.path.join(work_dir, f"speech_{i:05d}.mp3")
-            await create_tts(line, audio_path)
+            await create_tts(line, audio_path, voice)
             paths.append(audio_path)
-            progress(i / len(valid), f"မြန်မာအသံ ထုတ်နေပါသည် ({i}/{len(valid)})")
+            progress((i / len(valid)) * 0.55, f"မြန်မာအသံ ဖန်တီးခြင်း ({i}/{len(valid)})")
         return paths
 
     speech_paths = asyncio.run(generate_all())
@@ -366,6 +371,7 @@ def make_dubbed_timeline(video_path: str, srt_path: str, work_dir: str, progress
         audio_timeline += speech
         source_cursor = end
         used_count += 1
+        progress(0.55 + (i / len(valid)) * 0.45, f"Video အချိန်ကိုက်ညှိခြင်း ({i}/{len(valid)})")
 
     if source_cursor < video_duration - 0.02:
         tail = video_duration - source_cursor
@@ -414,22 +420,25 @@ def mux_video(video_path: str, audio_path: str, output_path: str, duration: floa
 check_login()
 
 st.title("🎬 Myanmar Auto Video Dubbing")
-st.caption("Video တစ်ခုတည်းတင်ပါ။ တရုတ် / အင်္ဂလိပ်အသံကို AI က စစ်ဆေးပြီး မြန်မာလို ပြန်ဆိုကာ Thiha Neural အသံဖြင့် ဒပ်ပေးပါမည်။")
+st.caption("Video တစ်ခုတည်းတင်ပါ။ တရုတ် / အင်္ဂလိပ်အသံကို စာသားဖော်ထုတ်၊ မြန်မာလိုပြန်ဆိုပြီး ရွေးချယ်ထားသော မြန်မာအသံဖြင့် ဒပ်ပေးပါမည်။")
 
 with st.sidebar:
     st.subheader("အသံဆက်တင်")
-    st.info(f"Voice: {VOICE}")
+    st.caption("မြန်မာအသံရွေးချယ်မှုကို အောက်တွင် ပြုလုပ်နိုင်ပါသည်။")
     st.caption(f"Upload ကန့်သတ်ချက်: {MAX_UPLOAD_MB} MB")
     st.caption("အသံစာသားထုတ်ယူခြင်း: Whisper Tiny (CPU)\nဘာသာပြန်: Gemini ရှိလျှင် Gemini၊ မရှိလျှင် Google Translate")
     if st.button("Logout", use_container_width=True):
         st.session_state["authenticated"] = False
         st.rerun()
 
+selected_voice_label = st.selectbox("🎙️ မြန်မာအသံရွေးချယ်ပါ", list(VOICES.keys()), index=0)
+selected_voice = VOICES[selected_voice_label]
+
 video_file = st.file_uploader("မူရင်းဗီဒီယို Upload လုပ်ပါ", type=["mp4", "mov", "mkv", "webm"])
 
 st.info(
     "လုပ်ဆောင်ပုံ — Video မှ အသံကို ထုတ်ယူမည် → Whisper ဖြင့် မူရင်းစကားကို စာသားထုတ်မည် → "
-    "မြန်မာလို ဘာသာပြန်မည် → Thiha Neural အသံထုတ်မည် → Video နှင့် အသံကို ပေါင်းစပ်မည်။ "
+    "မြန်မာလို ဘာသာပြန်မည် → ရွေးချယ်ထားသော မြန်မာအသံထုတ်မည် → Video နှင့် အသံကို ပေါင်းစပ်မည်။ "
     "အသံကို အမြန်/အနှေး မပြောင်းဘဲ Video အပိုင်းကိုသာ အသံနှင့် ကိုက်ညီအောင် ညှိပါမည်။"
 )
 
@@ -441,6 +450,7 @@ if video_file:
     elif st.button("🚀 START AUTO DUBBING", type="primary", use_container_width=True):
         status = st.empty()
         bar = st.progress(0)
+        st.caption(f"ရွေးချယ်ထားသောအသံ: {selected_voice_label}")
         try:
             with tempfile.TemporaryDirectory(prefix="myanmar_auto_dub_") as work_dir:
                 video_path = os.path.join(
@@ -451,26 +461,30 @@ if video_file:
                 with open(video_path, "wb") as f:
                     f.write(video_file.getbuffer())
 
-                status.info("၁။ Whisper ဖြင့် မူရင်းအသံကို နားထောင်ပြီး စာသားထုတ်/မြန်မာလို ဘာသာပြန်နေပါသည်...")
+                status.info("အဆင့် ၁/၅ — မူရင်း Video မှ အသံထုတ်ယူခြင်း (၁၀%)")
                 def update_ai(value, message):
-                    bar.progress(max(1, min(55, int(value * 55))))
-                    status.info(message)
+                    overall = 10 + int(value * 45)
+                    bar.progress(max(1, min(60, overall)))
+                    status.info(f"{message} | စုစုပေါင်း {overall}%")
 
                 cue_count, ai_warnings = transcribe_translate_video(
                     video_path, srt_path, work_dir, update_ai
                 )
-                status.info("၂။ Thiha Neural မြန်မာအသံနှင့် Video ကို အချိန်ကိုက် ပြုလုပ်နေပါသည်...")
+                status.info("အဆင့် ၃/၅ — ရွေးချယ်ထားသော မြန်မာအသံ ဖန်တီးခြင်း (၅၅% မှ ၇၇%)")
                 def update_tts(value, message):
-                    bar.progress(min(90, 55 + int(value * 35)))
-                    status.info(message)
+                    overall = 55 + int(value * 40)
+                    bar.progress(min(95, overall))
+                    stage = "အဆင့် ၃/၅" if value <= 0.55 else "အဆင့် ၄/၅"
+                    status.info(f"{stage} — {message} | စုစုပေါင်း {overall}%")
 
                 joined_video, audio_path, duration, count, fix_warnings = make_dubbed_timeline(
-                    video_path, srt_path, work_dir, update_tts
+                    video_path, srt_path, work_dir, selected_voice, update_tts
                 )
-                status.info("၃။ နောက်ဆုံး MP4 ဖိုင်ကို ပေါင်းစပ်နေပါသည်...")
+                status.info("အဆင့် ၅/၅ — နောက်ဆုံး MP4 ဖိုင်ပေါင်းစပ်ခြင်း (၉၅% မှ ၁၀၀%)")
+                bar.progress(95)
                 mux_video(joined_video, audio_path, mp4_output, duration)
                 bar.progress(100)
-                status.success(f"ပြီးပါပြီ။ မြန်မာအသံ {count} ပိုင်း ထုတ်လုပ်ပြီးပါပြီ။")
+                status.success(f"အဆင့် ၅/၅ ပြီးပါပြီ — ၁၀၀% | {selected_voice_label} အသံဖြင့် မြန်မာအသံ {count} ပိုင်း ထုတ်လုပ်ပြီးပါပြီ။")
                 if ai_warnings or fix_warnings:
                     with st.expander("လုပ်ဆောင်မှု မှတ်တမ်း"):
                         for warning in ai_warnings + fix_warnings:
