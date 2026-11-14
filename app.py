@@ -70,7 +70,7 @@ def transcribe_translate_video(video_path: str, srt_path: str, work_dir: str,
             )
             transcript_response = client.models.generate_content(
                 model="gemini-3.8-flash",
-                contents=["Transcribe all audible speech verbatim. Return only the spoken words. If there is no speech, return an empty response.", audio_part],
+                contents=["Listen to this audio carefully. Detect whether the speech is Chinese or English, then transcribe every audible spoken word in its original language. Do not translate yet. Return only the transcript. If there is no intelligible speech, return an empty response.", audio_part],
             )
             transcript = (transcript_response.text or "").strip()
             if transcript:
@@ -372,7 +372,7 @@ with st.sidebar:
     st.subheader("အသံဆက်တင်")
     st.info(f"Voice: {VOICE}")
     st.caption(f"Upload ကန့်သတ်ချက်: {MAX_UPLOAD_MB} MB")
-    st.caption("Gemini: 3.5 Transcribe + 3.8 Flash")
+    st.caption("Gemini: 3.8 Flash (အသံစာသားထုတ်ယူခြင်း + မြန်မာဘာသာပြန်)")
     if st.button("Logout", use_container_width=True):
         st.session_state["authenticated"] = False
         st.rerun()
