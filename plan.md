@@ -2,9 +2,9 @@
 
 ## Product scope
 
-Build a responsive Burmese-first web app inspired by Stream Wave's focused AI dubbing flow. The primary user journey is: upload an MP4 video, upload a Burmese `.srt` subtitle file, review the fixed Burmese Edge TTS voice, start processing, follow clear progress stages, and download the resulting `final_output.mp4`.
+Build a responsive Burmese-first web app inspired by Stream Wave's focused AI dubbing flow. The primary user journey is: upload an MP4 video, let the app transcribe and translate the source speech automatically (with an optional Burmese `.srt` override), review the fixed Burmese Edge TTS voice, start processing, follow clear progress stages, and download the resulting `final_output.mp4`.
 
-The user-provided Python script remains the core processing logic. It will be adapted into a command-line script that accepts explicit input/output paths, creates temporary audio and clip folders, uses `my-MM-ThihaNeural`, synchronizes clip duration to generated audio, concatenates the processed clips, and writes the final MP4. The Express server will receive multipart uploads, invoke the script with `python3`, and return a downloadable output URL.
+The user-provided Python script remains the core processing logic. It accepts explicit input/output paths, creates temporary audio and clip folders, uses `my-MM-ThihaNeural`, synchronizes clip duration to generated audio, concatenates the processed clips, and writes the final MP4. The Express server accepts a video-only request, extracts audio with FFmpeg, transcribes it through the configured speech service, translates timestamped segments into Burmese with the built-in LLM helper, writes a temporary SRT, invokes the Python pipeline with `python3`, and returns a downloadable output URL. A supplied SRT remains supported as an override.
 
 ## Design
 
@@ -45,7 +45,7 @@ Three possible directions considered:
 - `server/_core/index.ts`: upload route registration and download route.
 - `server/dubbing/pipeline.py`: adapted user-provided subtitle-to-Burmese-dubbing pipeline.
 - `server/dubbing/requirements.txt`: Python runtime dependencies.
-- `server/dubbing.ts`: upload validation, process spawning, job storage, and download lookup.
+- `server/dubbing.ts`: upload validation, automatic transcription/translation, temporary SRT creation, process spawning, job storage, and download lookup.
 - `public/manus-routes.json`: route manifest for `/` and `/404`.
 - `Dockerfile`: production runtime with Node, Python, pip packages, and FFmpeg.
 

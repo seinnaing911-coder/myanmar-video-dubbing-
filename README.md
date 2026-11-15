@@ -2,7 +2,7 @@
 
 This repository contains two ways to run the Myanmar video dubbing workflow:
 
-1. **dubwave web app** — a responsive React/Express website where users upload an MP4 and Burmese `.srt`, run the provided Edge TTS + FFmpeg pipeline, and download `final_output.mp4`.
+1. **dubwave web app** — a responsive React/Express website where users upload an MP4, automatically transcribe and translate the source speech into Burmese, run the Edge TTS + FFmpeg pipeline, and download `final_output.mp4`. A Burmese `.srt` can also be supplied optionally.
 2. **Streamlit app** — the original private studio in `app.py`, including Gemini-based video understanding and timeline-driven dubbing.
 
 ## dubwave web app
@@ -22,7 +22,9 @@ For the real dubbing endpoint, the runtime needs Python 3, FFmpeg, and the depen
 python3 -m pip install -r server/dubbing/requirements.txt
 ```
 
-The API accepts `POST /api/dubbing/process` with `video` (MP4) and `subtitles` (SRT) multipart fields, then returns a temporary download URL for `final_output.mp4`.
+The API accepts `POST /api/dubbing/process` with `video` (MP4) and an optional `subtitles` (SRT) multipart field. Without SRT, it extracts the audio, calls the configured transcription service, translates timestamped segments into natural spoken Burmese through the built-in LLM helper, then passes the generated SRT to the Edge TTS + FFmpeg pipeline. It returns a temporary download URL for `final_output.mp4`.
+
+The automatic mode requires the platform-provided `MANUS_API_URL` and `MANUS_API_KEY` for transcription and translation. These must be configured as deployment secrets and must never be committed to the repository.
 
 ## Streamlit app
 

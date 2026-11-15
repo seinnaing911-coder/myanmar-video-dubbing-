@@ -26,9 +26,9 @@ type Stage = {
 };
 
 const stages: Stage[] = [
-  { id: "parse", title: "စာတန်းထိုးကို ဖတ်နေပါတယ်", caption: "SRT timeline ကို စစ်ဆေးခြင်း" },
-  { id: "voice", title: "မြန်မာအသံ ထုတ်နေပါတယ်", caption: "Edge TTS · my-MM-ThihaNeural" },
-  { id: "clips", title: "Video clip တွေကို ညှိနေပါတယ်", caption: "စာကြောင်းတိုင်းရဲ့ အချိန်ကိုက်မှု" },
+  { id: "parse", title: "မူရင်းအသံကို စာသားဖော်ထုတ်နေပါတယ်", caption: "Video ထဲက စကားပြောသံကို ဖတ်ခြင်း" },
+  { id: "voice", title: "မြန်မာလို ပြန်ဆိုနေပါတယ်", caption: "အဓိပ္ပာယ်နဲ့ timing ကို ထိန်းထားခြင်း" },
+  { id: "clips", title: "မြန်မာအသံ ထုတ်နေပါတယ်", caption: "Edge TTS · my-MM-ThihaNeural" },
   { id: "mix", title: "အသံနဲ့ ရုပ်ပုံကို ပေါင်းနေပါတယ်", caption: "Original audio ကို မြန်မာအသံနဲ့ အစားထိုးခြင်း" },
   { id: "export", title: "Final video ထုတ်နေပါတယ်", caption: "Download လုပ်လို့ရမယ့် MP4" },
 ];
@@ -36,11 +36,11 @@ const stages: Stage[] = [
 const faqs = [
   {
     question: "ဘယ်လိုဖိုင်တွေ တင်လို့ရလဲ?",
-    answer: "MP4 video တစ်ဖိုင်နဲ့ မြန်မာစာတန်းထိုးထားတဲ့ UTF-8 .srt ဖိုင်တစ်ဖိုင် လိုပါတယ်။ Subtitle timeline က video အတွင်းက အချိန်နဲ့ ကိုက်ညီနေရင် output က ပိုကောင်းပါတယ်။",
+    answer: "MP4 video တစ်ဖိုင်တင်ရုံနဲ့ ရပါတယ်။ မူရင်းအသံကို အလိုအလျောက် စာသားဖော်ထုတ်ပြီး မြန်မာလို ပြန်ဆိုကာ အသံထည့်ပေးပါတယ်။ ကိုယ့်မှာ မြန်မာ SRT ရှိပြီးသားဆိုရင်လည်း ထည့်သုံးနိုင်ပါတယ်။",
   },
   {
     question: "အသံက ဘယ်လိုထွက်မလဲ?",
-    answer: "ဒီ version မှာ Microsoft Edge TTS ရဲ့ မြန်မာအသံ my-MM-ThihaNeural ကို သတ်မှတ်အသုံးပြုထားပါတယ်။ စာကြောင်းတစ်ကြောင်းချင်းစီကို အချိန်နဲ့ချိန်ပြီး video ထဲမှာ ပြန်ထည့်ပေးပါတယ်။",
+    answer: "ဒီ version မှာ Microsoft Edge TTS ရဲ့ မြန်မာအသံ my-MM-ThihaNeural ကို သတ်မှတ်အသုံးပြုထားပါတယ်။ မူရင်းအသံကို ဖယ်ပြီး မြန်မာအသံတစ်ခုတည်း ထည့်ပေးပါတယ်။",
   },
   {
     question: "ဖိုင်တွေကို သိမ်းထားမလား?",
@@ -132,10 +132,10 @@ export default function Home() {
   const [error, setError] = useState("");
   const [downloadUrl, setDownloadUrl] = useState("");
 
-  const canStart = Boolean(video && subtitles && status !== "processing");
+  const canStart = Boolean(video && status !== "processing");
 
   const startProcessing = async () => {
-    if (!video || !subtitles) return;
+    if (!video) return;
     setStatus("processing");
     setStageIndex(0);
     setError("");
@@ -144,7 +144,7 @@ export default function Home() {
     try {
       const body = new FormData();
       body.append("video", video);
-      body.append("subtitles", subtitles);
+      if (subtitles) body.append("subtitles", subtitles);
       const response = await fetch("/api/dubbing/process", { method: "POST", body });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.message || "Processing မအောင်မြင်ပါ။");
@@ -186,7 +186,7 @@ export default function Home() {
           <div className="hero-copy">
             <div className="eyebrow"><span className="eyebrow-dot" /> MYANMAR VOICE STUDIO <span className="eyebrow-line" /></div>
             <h1>ဗီဒီယိုတိုင်းကို<br /><em>မြန်မာလို</em> ပြောပါစေ။</h1>
-            <p className="hero-lead">Video တင်ပါ။ မြန်မာစာတန်းထိုးပေးပါ။ အသံထွက်နေတဲ့ dubbing video ကို ပြန်ရယူပါ။ ရှုပ်ထွေးတဲ့ editing မလိုပါဘူး။</p>
+            <p className="hero-lead">Video တင်ပါ။ မူရင်းအသံကို အလိုအလျောက်ဖတ်ပြီး မြန်မာအသံနဲ့ ပြန်ရယူပါ။ ရှုပ်ထွေးတဲ့ editing မလိုပါဘူး။</p>
             <a className="primary-link" href="#studio">စတင် dubbing လုပ်မယ် <ArrowDownRight size={18} /></a>
             <div className="hero-proof"><span className="proof-avatars"><i>MM</i><i>EN</i><i>TH</i></span><span>မြန်မာဖန်တီးရှင်တွေအတွက်<br /><strong>ရိုးရှင်းတဲ့ video workflow</strong></span></div>
           </div>
@@ -206,7 +206,7 @@ export default function Home() {
         <section className="studio-section page-width" id="studio">
           <div className="section-intro">
             <div><span className="section-number">01 / STUDIO</span><h2>အသံတစ်ခုနဲ့<br /><span>ဗီဒီယိုအသစ်</span> တစ်ခု။</h2></div>
-            <p>သင့်ရဲ့ source video နဲ့ မြန်မာ subtitle ကို ထည့်ပါ။ ကျန်တာကို dubwave က ကိုင်တွယ်ပေးပါမယ်။</p>
+            <p>သင့်ရဲ့ source video တစ်ဖိုင်ထည့်ပါ။ မြန်မာပြန်ဆိုခြင်း၊ အသံဖန်တီးခြင်းနဲ့ MP4 export အားလုံးကို dubwave က ကိုင်တွယ်ပေးပါမယ်။</p>
           </div>
           <div className="studio-card">
             <div className="studio-card__header"><div><span className="card-kicker"><Zap size={13} /> DUBBING CONSOLE</span><h3>ဖိုင်တွေကို ဒီမှာထည့်ပါ</h3></div><div className="secure-label"><LockKeyhole size={14} /> Secure processing</div></div>
@@ -221,18 +221,18 @@ export default function Home() {
               <div className="complete-view"><div className="complete-icon"><Check size={30} /></div><span className="card-kicker complete-kicker">EXPORT COMPLETE</span><h3>မြန်မာ dubbing video အဆင်သင့်ပါပြီ။</h3><p>သင့်ရဲ့ `final_output.mp4` ကို အခု download လုပ်နိုင်ပါပြီ။</p><div className="complete-actions"><a className="download-button" href={downloadUrl} download="final_output.mp4"><CloudDownload size={18} /> Download final_output.mp4 <ArrowUpRight size={15} /></a><button type="button" className="text-button" onClick={reset}>ဖိုင်အသစ်နဲ့ ပြန်စမယ်</button></div></div>
             ) : (
               <>
-                <div className="drop-grid"><div><label className="input-label"><span>01</span> SOURCE VIDEO</label><FileDropzone kind="video" file={video} onSelect={file => { setVideo(file); if (!file) setError("MP4 video ဖိုင်ကို ရွေးပေးပါ။"); else setError(""); }} onRemove={() => setVideo(null)} disabled={false} /></div><div><label className="input-label"><span>02</span> MYANMAR SUBTITLE</label><FileDropzone kind="srt" file={subtitles} onSelect={file => { setSubtitles(file); if (!file) setError(".srt subtitle ဖိုင်ကို ရွေးပေးပါ။"); else setError(""); }} onRemove={() => setSubtitles(null)} disabled={false} /></div></div>
+                <div className="drop-grid"><div><label className="input-label"><span>01</span> SOURCE VIDEO</label><FileDropzone kind="video" file={video} onSelect={file => { setVideo(file); if (!file) setError("MP4 video ဖိုင်ကို ရွေးပေးပါ။"); else setError(""); }} onRemove={() => setVideo(null)} disabled={false} /></div><div><label className="input-label"><span>02</span> OPTIONAL SUBTITLE</label><FileDropzone kind="srt" file={subtitles} onSelect={file => { setSubtitles(file); if (!file) setError(""); else setError(""); }} onRemove={() => setSubtitles(null)} disabled={false} /></div></div>
                 {error && <div className="inline-error"><CircleAlert size={16} /> {error}</div>}
                 <div className="setup-summary"><div className="summary-item"><span className="summary-icon"><Mic2 size={17} /></span><span><small>VOICE ENGINE</small><strong>my-MM-ThihaNeural</strong></span></div><div className="summary-item"><span className="summary-icon"><WandSparkles size={17} /></span><span><small>OUTPUT</small><strong>Synced MP4 · no watermark</strong></span></div><button className="start-button" type="button" disabled={!canStart} onClick={startProcessing}>Start dubbing <ArrowUpRight size={17} /></button></div>
-                <div className="studio-footnote"><LockKeyhole size={13} /> Files are processed for this job and held temporarily for download.</div>
+                <div className="studio-footnote"><LockKeyhole size={13} /> SRT မရှိလည်းရပါတယ်။ မူရင်းအသံကို အလိုအလျောက်ဖော်ထုတ်ပြီး မြန်မာလို ပြန်ဆိုပေးပါမယ်။</div>
               </>
             )}
           </div>
         </section>
 
         <section className="workflow-section page-width" id="how-it-works">
-          <div className="section-intro section-intro--compact"><div><span className="section-number">02 / HOW IT WORKS</span><h2>အဆင့်သုံးဆင့်။<br /><span>အသံတစ်ခုလုံး။</span></h2></div><p>Video editing tool တွေကို အများကြီး လေ့လာစရာမလိုဘဲ subtitle timeline ကို မြန်မာအသံနဲ့ ချိတ်ပေးပါတယ်။</p></div>
-          <div className="workflow-rail">{[{ number: "01", icon: <UploadCloud size={20} />, title: "ဖိုင်နှစ်ခု တင်ပါ", copy: "MP4 video နဲ့ မြန်မာ SRT ကို ရွေးပါ။" }, { number: "02", icon: <Mic2 size={20} />, title: "အသံကို တည်ဆောက်ပါ", copy: "စာကြောင်းတစ်ကြောင်းချင်းစီကို မြန်မာအသံနဲ့ ဖန်တီးပါတယ်။" }, { number: "03", icon: <CloudDownload size={20} />, title: "ပြီးရင် download လုပ်ပါ", copy: "အချိန်ကိုက်ထားတဲ့ final_output.mp4 ကို ရယူပါ။" }].map((item, index) => <div className="workflow-item" key={item.number}><div className="workflow-item__number">{item.number}</div><div className="workflow-item__icon">{item.icon}</div><h3>{item.title}</h3><p>{item.copy}</p>{index < 2 && <span className="workflow-arrow"><ArrowUpRight size={17} /></span>}</div>)}</div>
+          <div className="section-intro section-intro--compact"><div><span className="section-number">02 / HOW IT WORKS</span><h2>အဆင့်သုံးဆင့်။<br /><span>မြန်မာအသံတစ်ခုလုံး။</span></h2></div><p>စာတန်းထိုးမရှိလည်း video ထဲက မူရင်းစကားကို ဖတ်ပြီး မြန်မာအသံနဲ့ အစားထိုးပေးပါတယ်။</p></div>
+          <div className="workflow-rail">{[{ number: "01", icon: <UploadCloud size={20} />, title: "Video တစ်ဖိုင် တင်ပါ", copy: "MP4 video ကို ရွေးပါ။ SRT က optional ပါ။" }, { number: "02", icon: <Mic2 size={20} />, title: "ဘာသာပြန်ပြီး အသံတည်ဆောက်ပါ", copy: "မူရင်းစကားကို ဖတ်၊ မြန်မာလို ပြန်ဆိုပြီး အသံဖန်တီးပါတယ်။" }, { number: "03", icon: <CloudDownload size={20} />, title: "ပြီးရင် download လုပ်ပါ", copy: "မူရင်းအသံမပါတဲ့ မြန်မာ dubbing MP4 ကို ရယူပါ။" }].map((item, index) => <div className="workflow-item" key={item.number}><div className="workflow-item__number">{item.number}</div><div className="workflow-item__icon">{item.icon}</div><h3>{item.title}</h3><p>{item.copy}</p>{index < 2 && <span className="workflow-arrow"><ArrowUpRight size={17} /></span>}</div>)}</div>
         </section>
 
         <section className="feature-banner page-width"><div className="feature-banner__glow" /><div className="feature-banner__copy"><span className="section-number">BUILT FOR LOCAL VOICE</span><h2>မြန်မာအသံက<br /><em>နောက်ကျမနေသင့်ဘူး။</em></h2><p>သင်ကြိုက်တဲ့ content ကို မြန်မာ audience အတွက် ပြန်အသက်သွင်းပါ။ တစ်ကြောင်းချင်းစီကို subtitle time နဲ့ တိတိကျကျ ချိန်ညှိထားပါတယ်။</p></div><div className="feature-specs"><div><span>VOICE</span><strong>ThihaNeural</strong></div><div><span>FORMAT</span><strong>MP4 + SRT</strong></div><div><span>OUTPUT</span><strong>Synced audio</strong></div></div></section>

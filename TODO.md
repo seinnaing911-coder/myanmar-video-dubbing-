@@ -3,12 +3,18 @@
 ## Upload console accepts the required inputs
 
 - The home page provides an MP4 video upload control with clear file selection, filename display, and format validation.
-- The home page provides a Burmese SRT subtitle upload control with clear file selection, filename display, and format validation.
-- The processing action remains unavailable until both valid files are selected.
+- The home page provides an optional Burmese SRT subtitle upload control with clear file selection and format validation.
+- The processing action is available when a valid MP4 video is selected; without SRT the server automatically creates the Burmese timeline.
+
+## Automatic transcription and Burmese translation are connected
+
+- Starting processing with only an MP4 extracts the source audio and sends it to the configured transcription service.
+- Timestamped source segments are translated into natural spoken Burmese through the server-side built-in LLM helper.
+- The generated Burmese segments are written to a temporary SRT that preserves the source timing.
 
 ## Provided Burmese dubbing pipeline is connected
 
-- Starting processing sends the selected MP4 and SRT files to the server.
+- Starting processing sends the selected MP4 and optional SRT file to the server.
 - The server invokes the provided Python pipeline as the core dubbing logic.
 - The pipeline uses the fixed Edge TTS voice `my-MM-ThihaNeural` and writes the generated video as `final_output.mp4`.
 - Processing errors return a useful message and do not claim that a file was created.
