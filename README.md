@@ -24,7 +24,7 @@ python3 -m pip install -r server/dubbing/requirements.txt
 
 The API accepts `POST /api/dubbing/process` with `video` (MP4) and an optional `subtitles` (SRT) multipart field. Without SRT, it extracts the audio, calls the configured transcription service, translates timestamped segments into natural spoken Burmese through the built-in LLM helper, then passes the generated SRT to the Edge TTS + FFmpeg pipeline. It returns a temporary download URL for `final_output.mp4`.
 
-The automatic mode requires the platform-provided `MANUS_API_URL` and `MANUS_API_KEY` for transcription and translation. These must be configured as deployment secrets and must never be committed to the repository.
+On Manus-managed Preview/Publish, the platform injects `BUILT_IN_FORGE_API_URL` and `BUILT_IN_FORGE_API_KEY` automatically. External deployments can use the legacy `MANUS_API_URL` and `MANUS_API_KEY` names as environment variables instead. Never commit either credential to the repository.
 
 ## Streamlit app
 
