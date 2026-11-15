@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import shutil
 import subprocess
 import tempfile
@@ -33,7 +32,7 @@ def subtitle_seconds(item: pysrt.SubRipItem) -> tuple[float, float]:
 
 async def generate_audio(subtitles: pysrt.SubRipFile, audio_dir: Path) -> None:
     for index, subtitle in enumerate(subtitles):
-        text = subtitle.text.replace("\\n", " ").strip()
+        text = subtitle.text.replace("\n", " ").strip()
         if not text:
             continue
         audio_path = audio_dir / f"audio_{index}.mp3"
@@ -79,7 +78,7 @@ def process(video: Path, srt: Path, output: Path) -> None:
         processed_clips: list[Path] = []
 
         for index, subtitle in enumerate(subtitles):
-            text = subtitle.text.replace("\\n", " ").strip()
+            text = subtitle.text.replace("\n", " ").strip()
             audio_path = audio_dir / f"audio_{index}.mp3"
             if not text or not audio_path.exists():
                 continue
@@ -113,7 +112,7 @@ def process(video: Path, srt: Path, output: Path) -> None:
             raise ValueError("No usable subtitle clips were produced")
 
         filelist = work_dir / "filelist.txt"
-        filelist.write_text("".join(f"file '{clip.as_posix()}'\\n" for clip in processed_clips), encoding="utf-8")
+        filelist.write_text("".join(f"file '{clip.as_posix()}'\n" for clip in processed_clips), encoding="utf-8")
         output.parent.mkdir(parents=True, exist_ok=True)
         run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(filelist), "-c", "copy", str(output)])
         if not output.exists() or output.stat().st_size == 0:
